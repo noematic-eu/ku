@@ -1,0 +1,36 @@
+[package]
+name = "ku"
+version = "0.1.0"
+edition = "2024"
+description = "TUI de monitoring système avancé pour administrateurs (Linux + macOS)"
+license = "MIT"
+repository = "https://github.com/ku-monitor/ku"
+readme = "README.md"
+
+[dependencies]
+anyhow = "1.0.104"
+chrono = "0.4.45"
+clap = { version = "4.5", features = ["derive"] }
+crossterm = { version = "0.29.0", features = ["event-stream"] }
+dirs = "6.0.0"
+futures = "0.3"
+libc = "0.2.189"
+ratatui = "0.30.2"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+sysinfo = "0.39.6"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+toml = "1.1.4"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+unicode-width = "0.2.2"
+walkdir = "2.5.0"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
