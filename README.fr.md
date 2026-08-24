@@ -123,8 +123,11 @@ Le scan growth des `watched_paths` tourne en arrière-plan (intervalle `snapshot
 
 ## Soutenir
 
-Développé par [Noematic](https://github.com/noematic-eu).  
-Soutenir le projet : [payhip.com/b/pVwaY](https://payhip.com/b/pVwaY)
+Développé par [Noematic](https://github.com/noematic-eu).
+
+- [GitHub Sponsors](https://github.com/sponsors/noematic-eu)
+- [Patreon](https://www.patreon.com/noematic-eu)
+- [Payhip](https://payhip.com/b/pVwaY)
 
 ## Licence
 

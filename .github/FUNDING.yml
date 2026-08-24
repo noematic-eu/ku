@@ -1,4 +1,5 @@
-# Shown as the Sponsor button on the GitHub repo.
 github: noematic-eu
 patreon: noematic-eu
-custom: ["https://payhip.com/b/pVwaY"]
+custom:
+  - "https://payhip.com/b/pVwaY"
+
