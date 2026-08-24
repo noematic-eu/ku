@@ -2,13 +2,9 @@
 
 TUI de monitoring système pour administrateurs. Linux et macOS. Écrit en Rust avec [ratatui](https://ratatui.rs).
 
-Au-delà d’un `htop` classique, `ku` ajoute le suivi d’espace disque, l’évolution des dossiers (growth tracking) et un historique des processus.
+Au-delà d’un `htop` classique, `ku` ajoute le suivi d’espace disque, l’évolution des dossiers (growth tracking) et le nettoyage des données orphelines d’applications désinstallées.
 
 ## Installer / lancer
-
-```bash
-cargo run --release
-```
 
 ```bash
 cargo install --path .
@@ -16,25 +12,29 @@ ku
 ```
 
 ```bash
+cargo run --release
+```
+
+```bash
 ku --config /chemin/config.toml
 ku --dump-config
 ku --once                 # un snapshot texte, sans TUI
 sudo ku                   # mêmes dossiers config/data que SUDO_USER (pas root)
-
-ku orphans                # leftover data from uninstalled apps (dry-run)
-ku orphans --json
-sudo ku orphans           # also /Library and /var/lib when readable
-ku orphans --rm PATH      # delete one leftover file or directory (confirms)
-ku orphans --rm APP_ID --all   # delete every leftover for that app (confirms)
-ku orphans --ignore APP_OR_PATH   # hide from future scans (config.toml)
-ku orphans --unignore APP_OR_PATH
-ku orphans --ignored              # print allowlist
-ku orphans --clear-ignore
-ku orphans --fda          # macOS: open Full Disk Access settings
-sudo ku                   # same user config/data; or press e after a permission error
 ```
 
-On macOS, leftover delete under `~/Library/Containers` (and similar) needs **Full Disk Access** for the **terminal app** (Terminal, iTerm, Ghostty…). `sudo` does not replace it. `F` in the leftovers view, or `ku orphans --fda`, opens the Privacy pane.
+Leftovers d’apps (dry-run par défaut) :
+
+```bash
+ku orphans
+ku orphans --json
+sudo ku orphans           # aussi /Library et /var/lib si lisibles
+ku orphans --rm PATH      # supprime un chemin (demande confirmation)
+ku orphans --rm APP_ID --all
+ku orphans --ignore APP_OR_PATH
+ku orphans --fda          # macOS : ouvre Accès complet au disque
+```
+
+Sur macOS, supprimer sous `~/Library/Containers` (et assimilés) demande **l’accès complet au disque** pour **l’app terminal** (Terminal, iTerm, Ghostty…), pas pour le binaire `ku`. `sudo` ne contourne pas ça. `F` dans la vue leftovers, ou `ku orphans --fda`, ouvre le panneau Confidentialité.
 
 ## Vues
 
@@ -53,18 +53,17 @@ On macOS, leftover delete under `~/Library/Containers` (and similar) needs **Ful
 - `j` `k` ou flèches — navigation
 - `/` — filtre (`nginx cpu>5 mem>100M user:root`)
 - `s` / `S` — tri / inverser
-- `Enter` — détail (disk / process) ; Growth : pourquoi ça a changé (fichiers vs dossiers récursifs)
+- `Enter` — détail ; Growth : pourquoi ça a changé (fichier vs dossier récursif)
+- `e` — Growth : `ncdu` si installé, sinon Finder / explorateur
+- `t` — Growth : top 50 des contributions, ou toute la liste
+- `o` — leftovers d’apps ; `d` un chemin, `a` tout le groupe
+- `i` / `I` — ignorer un chemin / toute l’app
+- `F` — macOS : Accès complet au disque
 - `a` — actions process (kill, kill -9, renice, inspect)
 - `h` — historique process, ou fenêtre growth
-- `e` — Growth : `ncdu` si disponible, sinon révéler dans Finder / explorateur Linux
-- `t` — Growth : top 50 des contributions (apparitions / disparitions) ou toute la liste
-- `o` — Growth : leftover apps (orphelins) ; `d` un chemin, `a` tout le groupe
-- `i` / `I` — ignorer un chemin / toute l’app (allowlist dans `config.toml`)
-- `u` — voir l’allowlist ; `d`/`x` retirer, `c` tout vider
-- `F` — macOS : ouvrir Accès complet au disque (ajouter **le Terminal**, pas `ku`)
 - `r` — recharger
 - `q` — quitter
-- souris — clic sur un onglet, une valeur de config, une ligne (double-clic = détail), molette, clic droit process, `help` / `quit` en bas
+- souris — onglets, config, lignes (double-clic = détail), molette
 
 ## Configuration
 
@@ -78,7 +77,7 @@ Fichier par défaut (celui de l’utilisateur qui lance `ku`, y compris via `sud
 refresh_interval = 2
 theme = "dark"          # dark | light
 history_retention_days = 7
-page_jump = 0           # 0 = auto (~80% of visible rows); or 5, 10, 20…
+page_jump = 0           # 0 = auto (~80% of visible rows)
 
 [disk]
 warning_threshold = 80
@@ -93,7 +92,6 @@ watched_paths = [
 history_window = ["1m", "5m", "1h", "24h"]
 
 [orphans]
-# leftover app ids or exact paths hidden from `o` / `ku orphans`
 ignore = []
 ```
 
@@ -104,10 +102,15 @@ Snapshots SQLite (rétention 7 jours, max 30) :
 - Linux : `~/.local/share/ku/history.db`
 - macOS : `~/Library/Application Support/ku/history.db`
 
-`sudo ku` lit et écrit ces chemins pour `SUDO_USER` (pas `/var/root` / `/root`), et rend les fichiers à cet utilisateur.
+`sudo ku` lit et écrit ces chemins pour `SUDO_USER` (pas `/var/root` / `/root`).
 
-Le scan growth des `watched_paths` tourne en arrière-plan (intervalle `snapshot_interval`, 5 min par défaut). Les arbres trop larges sont bornés (profondeur, nombre d’entrées, dossiers type `node_modules` / `.git`).
+Le scan growth des `watched_paths` tourne en arrière-plan (intervalle `snapshot_interval`, 5 min par défaut).
 
-## Roadmap
+## Soutenir
 
-Voir `spec.md`. Cette version couvre le MVP (dashboard, disk, process temps réel) plus les fondations V0.2 (historique process, growth) et V0.3 (config, thèmes, alertes). Network est prévu en V0.4.
+Développé par [Noematic](https://github.com/noematic-eu).  
+Soutenir le projet : [payhip.com/b/pVwaY](https://payhip.com/b/pVwaY)
+
+## Licence
+
+[MIT](LICENSE)

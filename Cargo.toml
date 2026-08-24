@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2024"
 description = "TUI de monitoring système avancé pour administrateurs (Linux + macOS)"
 license = "MIT"
-repository = "https://github.com/ku-monitor/ku"
+authors = ["Noematic <contact@noematic.eu>"]
+repository = "https://github.com/noematic-eu/ku"
+homepage = "https://github.com/noematic-eu/ku"
 readme = "README.md"
 
 [dependencies]
