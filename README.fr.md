@@ -2,6 +2,10 @@
 
 [English](README.md) · **Français**
 
+[![GitHub Sponsors](https://img.shields.io/badge/Sponsor-GitHub-ea4aaa?logo=github&logoColor=white)](https://github.com/sponsors/noematic-eu)
+[![Patreon](https://img.shields.io/badge/Patreon-noematic--eu-f96854?logo=patreon&logoColor=white)](https://www.patreon.com/noematic-eu)
+[![Payhip](https://img.shields.io/badge/Payhip-soutenir-1a1a1a)](https://payhip.com/b/pVwaY)
+
 ```
  _           
 | | ___ _   _ 
