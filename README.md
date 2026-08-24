@@ -1,5 +1,7 @@
 # ku
 
+**English** · [Français](README.fr.md)
+
 ```
  _           
 | | ___ _   _ 
@@ -9,7 +11,7 @@
 htop + df + ncdu
 ```
 
-TUI d’administrateur, Linux et macOS. CPU, mémoire, volumes et process en direct — plus ce que `htop` ne fait pas. **Growth** montre quels dossiers ont grandi ou disparu, et *pourquoi* (fichier vs arbre récursif). **Orphans** liste les restes d’apps désinstallées. Écrit en Rust avec [ratatui](https://ratatui.rs).
+A sysadmin TUI for Linux and macOS. Live CPU, memory, volumes, and processes — plus what `htop` does not do. **Growth** shows which folders grew or vanished, and *why* (file vs recursive tree). **Orphans** lists leftover data from uninstalled apps. Written in Rust with [ratatui](https://ratatui.rs).
 
 ![Dashboard](docs/screenshots/dash.png)
 
@@ -17,7 +19,7 @@ TUI d’administrateur, Linux et macOS. CPU, mémoire, volumes et process en dir
 
 ![Growth tracking](docs/screenshots/growth.png)
 
-## Installer / lancer
+## Install / run
 
 ```bash
 cargo install --path .
@@ -29,61 +31,61 @@ cargo run --release
 ```
 
 ```bash
-ku --config /chemin/config.toml
+ku --config /path/to/config.toml
 ku --dump-config
-ku --once                 # un snapshot texte, sans TUI
-sudo ku                   # mêmes dossiers config/data que SUDO_USER (pas root)
+ku --once                 # one text snapshot, no TUI
+sudo ku                   # same config/data dirs as SUDO_USER (not root)
 ```
 
-Leftovers d’apps (dry-run par défaut) :
+App leftovers (always a dry-run unless you pass `--rm`):
 
 ```bash
 ku orphans
 ku orphans --json
-sudo ku orphans           # aussi /Library et /var/lib si lisibles
-ku orphans --rm PATH      # supprime un chemin (demande confirmation)
+sudo ku orphans           # also /Library and /var/lib when readable
+ku orphans --rm PATH      # delete one path (asks for confirmation)
 ku orphans --rm APP_ID --all
 ku orphans --ignore APP_OR_PATH
-ku orphans --fda          # macOS : ouvre Accès complet au disque
+ku orphans --fda          # macOS: open Full Disk Access settings
 ```
 
-Sur macOS, supprimer sous `~/Library/Containers` (et assimilés) demande **l’accès complet au disque** pour **l’app terminal** (Terminal, iTerm, Ghostty…), pas pour le binaire `ku`. `sudo` ne contourne pas ça. `F` dans la vue leftovers, ou `ku orphans --fda`, ouvre le panneau Confidentialité.
+On macOS, deleting under `~/Library/Containers` (and similar) needs **Full Disk Access** for the **terminal app** (Terminal, iTerm, Ghostty…), not the `ku` binary. `sudo` does not bypass that. `F` in the leftovers view, or `ku orphans --fda`, opens the Privacy pane.
 
-## Vues
+## Views
 
-| Touche | Vue |
-|--------|-----|
-| `1` | Dashboard (CPU, mémoire, load, volumes, alertes) |
-| `2` | Disk (volumes, inodes, seuils) |
-| `3` | Growth (dossiers qui grandissent / rétrécissent) |
-| `4` | Processes (live + historique) |
+| Key | View |
+|-----|------|
+| `1` | Dashboard (CPU, memory, load, volumes, alerts) |
+| `2` | Disk (volumes, inodes, thresholds) |
+| `3` | Growth (folders that grew / shrank) |
+| `4` | Processes (live + history) |
 | `5` | Settings |
 | `6` / `?` | Help |
 
-## Raccourcis
+## Shortcuts
 
-- `Tab` / `Shift+Tab` — changer de vue
-- `j` `k` ou flèches — navigation
-- `/` — filtre (`nginx cpu>5 mem>100M user:root`)
-- `s` / `S` — tri / inverser
-- `Enter` — détail ; Growth : pourquoi ça a changé (fichier vs dossier récursif)
-- `e` — Growth : `ncdu` si installé, sinon Finder / explorateur
-- `t` — Growth : top 50 des contributions, ou toute la liste
-- `o` — leftovers d’apps ; `d` un chemin, `a` tout le groupe
-- `i` / `I` — ignorer un chemin / toute l’app
-- `F` — macOS : Accès complet au disque
-- `a` — actions process (kill, kill -9, renice, inspect)
-- `h` — historique process, ou fenêtre growth
-- `r` — recharger
-- `q` — quitter
-- souris — onglets, config, lignes (double-clic = détail), molette
+- `Tab` / `Shift+Tab` — switch view
+- `j` `k` or arrows — move
+- `/` — filter (`nginx cpu>5 mem>100M user:root`)
+- `s` / `S` — sort / reverse
+- `Enter` — detail; Growth: why it changed (file vs recursive dir)
+- `e` — Growth: `ncdu` if installed, else Finder / file manager
+- `t` — Growth: top 50 contributions, or the full list
+- `o` — leftover apps; `d` one path, `a` the whole group
+- `i` / `I` — ignore a path / the whole app
+- `F` — macOS: Full Disk Access
+- `a` — process actions (kill, kill -9, renice, inspect)
+- `h` — process history, or growth window
+- `r` — reload
+- `q` — quit
+- mouse — tabs, config, rows (double-click = detail), wheel
 
 ## Configuration
 
-Fichier par défaut (celui de l’utilisateur qui lance `ku`, y compris via `sudo`) :
+Default file (the user who launched `ku`, including via `sudo`):
 
-- Linux : `~/.config/ku/config.toml`
-- macOS : `~/Library/Application Support/ku/config.toml`
+- Linux: `~/.config/ku/config.toml`
+- macOS: `~/Library/Application Support/ku/config.toml`
 
 ```toml
 [general]
@@ -108,22 +110,22 @@ history_window = ["1m", "5m", "1h", "24h"]
 ignore = []
 ```
 
-## Données
+## Data
 
-Snapshots SQLite (rétention 7 jours, max 30) :
+SQLite snapshots (7-day retention, max 30):
 
-- Linux : `~/.local/share/ku/history.db`
-- macOS : `~/Library/Application Support/ku/history.db`
+- Linux: `~/.local/share/ku/history.db`
+- macOS: `~/Library/Application Support/ku/history.db`
 
-`sudo ku` lit et écrit ces chemins pour `SUDO_USER` (pas `/var/root` / `/root`).
+`sudo ku` reads and writes these paths for `SUDO_USER` (not `/var/root` / `/root`).
 
-Le scan growth des `watched_paths` tourne en arrière-plan (intervalle `snapshot_interval`, 5 min par défaut).
+The growth scan of `watched_paths` runs in the background (`snapshot_interval`, 5 minutes by default).
 
-## Soutenir
+## Support
 
-Développé par [Noematic](https://github.com/noematic-eu).  
-Soutenir le projet : [payhip.com/b/pVwaY](https://payhip.com/b/pVwaY)
+Built by [Noematic](https://github.com/noematic-eu).  
+Sponsor the project: [payhip.com/b/pVwaY](https://payhip.com/b/pVwaY)
 
-## Licence
+## License
 
 [MIT](LICENSE)
