@@ -80,7 +80,8 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         .highlight_symbol("▌ ");
     let offset = app.disk_state.offset();
     let len = app.visible_disks().count();
-    register_table_rows(&mut app.hits, area, offset, len, Some(Hit::CycleSort));
+    app.list_viewport_rows =
+        register_table_rows(&mut app.hits, area, offset, len, Some(Hit::CycleSort));
     frame.render_stateful_widget(table, area, &mut app.disk_state);
 }
 

@@ -261,7 +261,7 @@ impl Storage {
         Ok(rows.filter_map(Result::ok).collect())
     }
 
-    pub fn growth_for_window(&self, window_secs: i64) -> Result<Vec<GrowthRow>> {
+    pub fn growth_snapshots(&self, window_secs: i64) -> Result<(Vec<PathSize>, Vec<PathSize>)> {
         let now = chrono::Local::now().timestamp();
         let target = now - window_secs;
         let conn = self.lock()?;
@@ -270,7 +270,7 @@ impl Storage {
             .optional()?
             .flatten();
         let Some(latest) = latest else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         };
         let previous: Option<i64> = conn
             .query_row(
@@ -292,6 +292,11 @@ impl Storage {
             Some(ts) if ts != latest => load_dirs(&conn, ts)?,
             _ => Vec::new(),
         };
+        Ok((current, previous))
+    }
+
+    pub fn growth_for_window(&self, window_secs: i64) -> Result<Vec<GrowthRow>> {
+        let (current, previous) = self.growth_snapshots(window_secs)?;
         Ok(crate::collector::growth::compute_deltas(
             &current, &previous,
         ))

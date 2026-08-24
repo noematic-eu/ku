@@ -1,3 +1,9 @@
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::OnceLock;
+
+use anyhow::{Context, Result, bail};
 use unicode_width::UnicodeWidthStr;
 
 const UNITS: [&str; 7] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
@@ -34,6 +40,25 @@ pub fn format_percent(pct: f64) -> String {
         return "—".to_string();
     }
     format!("{pct:5.1}%")
+}
+
+pub fn format_mtime_ago(mtime: Option<i64>) -> String {
+    let Some(ts) = mtime else {
+        return "—".into();
+    };
+    let now = chrono::Local::now().timestamp();
+    let days = (now - ts).max(0) / 86_400;
+    if days == 0 {
+        "today".into()
+    } else if days == 1 {
+        "1d".into()
+    } else if days < 45 {
+        format!("{days}d")
+    } else if days < 548 {
+        format!("{}mo", days / 30)
+    } else {
+        format!("{}y", days / 365)
+    }
 }
 
 pub fn format_uptime(secs: u64) -> String {
@@ -244,6 +269,186 @@ pub fn inode_usage(_path: &std::path::Path) -> Option<(u64, u64)> {
     None
 }
 
+pub fn file_manager_label() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Finder"
+    } else if cfg!(target_os = "windows") {
+        "Explorer"
+    } else {
+        "file manager"
+    }
+}
+
+pub fn ncdu_available() -> bool {
+    static AVAIL: OnceLock<bool> = OnceLock::new();
+    *AVAIL.get_or_init(|| find_in_path("ncdu").is_some())
+}
+
+/// Short label for the growth inspect shortcut (`ncdu` or `reveal`).
+pub fn reveal_shortcut_label() -> &'static str {
+    if ncdu_available() { "ncdu" } else { "reveal" }
+}
+
+pub fn find_in_path(bin: &str) -> Option<PathBuf> {
+    find_in_path_from(bin, std::env::var_os("PATH")?.as_os_str())
+}
+
+fn find_in_path_from(bin: &str, path_var: &OsStr) -> Option<PathBuf> {
+    for dir in std::env::split_paths(path_var) {
+        let candidate = dir.join(bin);
+        if is_executable(&candidate) {
+            return Some(candidate);
+        }
+        #[cfg(windows)]
+        {
+            let exe = dir.join(format!("{bin}.exe"));
+            if exe.is_file() {
+                return Some(exe);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = path.metadata() else {
+        return false;
+    };
+    meta.is_file() && meta.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn is_executable(path: &Path) -> bool {
+    path.is_file()
+}
+
+/// Directory ncdu should scan: `path` if it is a directory, otherwise its parent.
+///
+/// Only walks up when metadata confirms a non-directory. A failed `is_dir()`
+/// check must not promote `/Users/me/work` to `/Users/me`.
+pub fn inspect_dir(path: &Path) -> PathBuf {
+    ncdu_scan_dir(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+pub fn ncdu_scan_dir(path: &Path) -> Result<PathBuf> {
+    if path.as_os_str().is_empty() {
+        bail!("empty path");
+    }
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    };
+    let meta =
+        std::fs::metadata(&abs).with_context(|| format!("{} no longer exists", abs.display()))?;
+    let dir = if meta.is_dir() {
+        abs
+    } else {
+        abs.parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .ok_or_else(|| anyhow::anyhow!("no parent directory for {}", abs.display()))?
+    };
+    Ok(dir.canonicalize().unwrap_or(dir))
+}
+
+/// Run `ncdu` on `path` (blocking). Caller must have left the TUI first.
+///
+/// `current_dir` + `.` so ncdu 2 cannot fall back to $HOME / cwd if the
+/// positional path is ignored.
+pub fn run_ncdu(path: &Path) -> Result<()> {
+    let dir = ncdu_scan_dir(path)?;
+    let bin = find_in_path("ncdu").unwrap_or_else(|| PathBuf::from("ncdu"));
+    Command::new(&bin)
+        .current_dir(&dir)
+        .arg("--ignore-config")
+        .arg("--")
+        .arg(".")
+        .status()
+        .with_context(|| format!("running ncdu in {}", dir.display()))?;
+    Ok(())
+}
+
+/// Open `path` in the desktop file manager (Finder, Explorer, Nautilus…).
+///
+/// Directories are opened so their contents are visible. Files are revealed
+/// (selected in the parent folder) when the OS supports it.
+pub fn reveal_in_file_manager(path: &Path) -> Result<()> {
+    if path.as_os_str().is_empty() {
+        bail!("empty path");
+    }
+    if !path.exists() {
+        bail!("{} no longer exists", path.display());
+    }
+
+    let label = file_manager_label();
+    if cfg!(target_os = "macos") {
+        if path.is_dir() {
+            spawn_gui("open", &[path.as_os_str()], label)
+        } else {
+            spawn_gui(
+                "open",
+                &[std::ffi::OsStr::new("-R"), path.as_os_str()],
+                label,
+            )
+        }
+    } else if cfg!(target_os = "windows") {
+        let select = format!("/select,{}", path.display());
+        spawn_gui("explorer", &[std::ffi::OsStr::new(&select)], label)
+    } else {
+        let target = if path.is_dir() {
+            path.to_path_buf()
+        } else {
+            path.parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(path)
+                .to_path_buf()
+        };
+        spawn_gui("xdg-open", &[target.as_os_str()], label)
+    }
+}
+
+fn spawn_gui(program: &str, args: &[&std::ffi::OsStr], label: &str) -> Result<()> {
+    let status = match sudo_user() {
+        Some(user) => {
+            let mut cmd = gui_command("sudo");
+            cmd.arg("-n").arg("-u").arg(&user).arg(program).args(args);
+            match cmd.status() {
+                Ok(st) if st.success() => return Ok(()),
+                Ok(_) | Err(_) => gui_command(program).args(args).status(),
+            }
+        }
+        None => gui_command(program).args(args).status(),
+    }
+    .with_context(|| format!("opening {label} ({program})"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        bail!("could not open in {label} ({status})")
+    }
+}
+
+fn gui_command(program: &str) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    cmd
+}
+
+fn sudo_user() -> Option<String> {
+    let user = std::env::var("SUDO_USER").ok()?;
+    if user.is_empty() || user == "root" {
+        None
+    } else {
+        Some(user)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,6 +460,11 @@ mod tests {
         assert_eq!(format_bytes(5 * 1024 * 1024), "5.00 MiB");
         assert_eq!(format_bytes_signed(-2048), "-2.00 KiB");
         assert_eq!(format_bytes_signed(0), "0 B");
+    }
+
+    #[test]
+    fn mtime_ago_unknown() {
+        assert_eq!(format_mtime_ago(None), "—");
     }
 
     #[test]
@@ -316,5 +526,59 @@ mod tests {
         let t = truncate_ellipsis("abcdefghij", 5);
         assert!(t.ends_with('…'));
         assert!(t.width() <= 5);
+    }
+
+    #[test]
+    fn reveal_rejects_missing_path() {
+        let err = reveal_in_file_manager(Path::new("/no/such/ku-reveal-test-path")).unwrap_err();
+        assert!(err.to_string().contains("no longer exists"));
+        let err = reveal_in_file_manager(Path::new("")).unwrap_err();
+        assert!(err.to_string().contains("empty path"));
+    }
+
+    #[test]
+    fn inspect_dir_uses_parent_for_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let want = dir.path().canonicalize().unwrap();
+        assert_eq!(ncdu_scan_dir(dir.path()).unwrap(), want);
+        assert_eq!(ncdu_scan_dir(&file).unwrap(), want);
+        let nested = dir.path().join("sub");
+        std::fs::create_dir(&nested).unwrap();
+        assert_eq!(
+            ncdu_scan_dir(&nested).unwrap(),
+            nested.canonicalize().unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_in_path_sees_executable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("fakebin");
+        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        let mut perm = std::fs::metadata(&bin).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&bin, perm).unwrap();
+        assert_eq!(
+            find_in_path_from("fakebin", dir.path().as_os_str()).as_deref(),
+            Some(bin.as_path())
+        );
+        assert!(find_in_path_from("missing", dir.path().as_os_str()).is_none());
+    }
+
+    #[test]
+    fn file_manager_label_is_os_specific() {
+        let label = file_manager_label();
+        assert!(!label.is_empty());
+        if cfg!(target_os = "macos") {
+            assert_eq!(label, "Finder");
+        } else if cfg!(target_os = "windows") {
+            assert_eq!(label, "Explorer");
+        } else {
+            assert_eq!(label, "file manager");
+        }
     }
 }

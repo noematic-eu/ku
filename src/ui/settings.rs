@@ -6,6 +6,7 @@ use ratatui::widgets::Paragraph;
 
 use crate::app::App;
 use crate::hits::{Hit, SettingField};
+use crate::orphans;
 use crate::ui::widgets::bordered;
 
 pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -100,6 +101,16 @@ fn setting_rows(app: &App) -> Vec<SettingRow> {
             value: cfg.general.history_retention_days.to_string(),
             live: true,
         },
+        SettingRow::Field {
+            field: SettingField::PageJump,
+            key: "page_jump",
+            value: if cfg.general.page_jump == 0 {
+                "auto (~80% of list)".into()
+            } else {
+                cfg.general.page_jump.to_string()
+            },
+            live: true,
+        },
         SettingRow::Blank,
         SettingRow::Header("disk"),
         SettingRow::Field {
@@ -120,6 +131,24 @@ fn setting_rows(app: &App) -> Vec<SettingRow> {
             value: format!("{}s", cfg.disk.snapshot_interval),
             live: false,
         },
+        SettingRow::Blank,
+        SettingRow::Header("orphans"),
+        SettingRow::Note(format!(
+            "  ignore     {} rule(s) in config.toml  ·  u in leftovers to edit",
+            cfg.orphans.ignore.len()
+        )),
+        SettingRow::Note(if orphans::fda_needed() {
+            if orphans::fda_missing() {
+                format!(
+                    "  disk access  missing — add {} in Privacy → Full Disk Access (F in leftovers)",
+                    orphans::fda_app_hint()
+                )
+            } else {
+                format!("  disk access  ok ({})", orphans::fda_app_hint())
+            }
+        } else {
+            "  disk access  n/a".into()
+        }),
         SettingRow::Blank,
         SettingRow::Header("processes"),
         SettingRow::Note("  history_window is edited in config.toml".into()),

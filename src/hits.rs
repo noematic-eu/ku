@@ -11,6 +11,7 @@ pub enum SettingField {
     Warn,
     Crit,
     Snapshot,
+    PageJump,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,6 +24,7 @@ pub enum Hit {
     Setting(SettingField),
     DashDisk(usize),
     GrowthWindow,
+    GrowthLimit,
     OverlayAction(usize),
     OverlayYes,
     OverlayNo,
@@ -97,9 +99,9 @@ pub fn register_table_rows(
     offset: usize,
     len: usize,
     header: Option<Hit>,
-) {
+) -> usize {
     if area.width < 3 || area.height < 3 {
-        return;
+        return 1;
     }
     let inner = Rect {
         x: area.x.saturating_add(1),
@@ -120,6 +122,7 @@ pub fn register_table_rows(
     }
     let start_y = inner.y.saturating_add(1);
     let visible = inner.height.saturating_sub(1);
+    let visible_rows = visible as usize;
     for vis in 0..visible {
         let idx = offset + vis as usize;
         if idx >= len {
@@ -135,6 +138,7 @@ pub fn register_table_rows(
             Hit::TableRow(idx),
         );
     }
+    visible_rows.max(1)
 }
 
 #[cfg(test)]

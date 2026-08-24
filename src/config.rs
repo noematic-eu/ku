@@ -12,6 +12,8 @@ pub struct Config {
     pub disk: DiskConfig,
     #[serde(default)]
     pub processes: ProcessConfig,
+    #[serde(default, skip_serializing_if = "OrphansConfig::is_empty")]
+    pub orphans: OrphansConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,6 +24,9 @@ pub struct GeneralConfig {
     pub theme: String,
     #[serde(default = "default_retention")]
     pub history_retention_days: u32,
+    /// PageUp/PageDown jump. 0 = auto (~80% of visible rows).
+    #[serde(default)]
+    pub page_jump: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,12 +47,26 @@ pub struct ProcessConfig {
     pub history_window: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OrphansConfig {
+    /// App ids or leftover paths hidden from the orphans list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignore: Vec<String>,
+}
+
+impl OrphansConfig {
+    fn is_empty(&self) -> bool {
+        self.ignore.is_empty()
+    }
+}
+
 impl Default for GeneralConfig {
     fn default() -> Self {
         Self {
             refresh_interval: default_refresh(),
             theme: default_theme(),
             history_retention_days: default_retention(),
+            page_jump: 0,
         }
     }
 }
@@ -156,6 +175,9 @@ impl Config {
         if self.processes.history_window.is_empty() {
             self.processes.history_window = default_windows();
         }
+        self.orphans.ignore.retain(|s| !s.trim().is_empty());
+        self.orphans.ignore.sort();
+        self.orphans.ignore.dedup();
         let theme = self.general.theme.to_ascii_lowercase();
         self.general.theme = if theme == "light" { "light" } else { "dark" }.into();
     }
@@ -210,6 +232,7 @@ history_window = ["1m", "5m", "1h", "24h"]
         let mut cfg: Config = toml::from_str(raw).unwrap();
         cfg.normalize();
         assert_eq!(cfg.general.refresh_interval, 2);
+        assert_eq!(cfg.general.page_jump, 0);
         assert_eq!(cfg.disk.critical_threshold, 90);
         assert_eq!(cfg.processes.history_window.len(), 4);
     }
@@ -234,5 +257,23 @@ history_window = ["1m", "5m", "1h", "24h"]
         cfg.save(&path).unwrap();
         let (loaded, _) = Config::load(Some(&path)).unwrap();
         assert_eq!(loaded.general.theme, "light");
+    }
+
+    #[test]
+    fn orphans_ignore_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut cfg = Config::default();
+        cfg.orphans.ignore = vec!["com.foo".into(), "/Users/x/Library/Caches/Bar".into()];
+        cfg.save(&path).unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("[orphans]"));
+        assert!(raw.contains("com.foo"));
+        let (loaded, _) = Config::load(Some(&path)).unwrap();
+        assert_eq!(loaded.orphans.ignore.len(), 2);
+        cfg.orphans.ignore.clear();
+        cfg.save(&path).unwrap();
+        let (loaded, _) = Config::load(Some(&path)).unwrap();
+        assert!(loaded.orphans.ignore.is_empty());
     }
 }

@@ -5,7 +5,8 @@ pub mod memory;
 pub mod process;
 
 use std::collections::VecDeque;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local};
 use sysinfo::{Disks, ProcessRefreshKind, ProcessesToUpdate, System, Users};
@@ -232,32 +233,42 @@ fn build_alerts(
     alerts
 }
 
-pub async fn run(config: Config, tx: watch::Sender<Snapshot>, storage: Storage) {
+/// Dedicated OS thread: sysinfo refreshes are sync and would stall a tokio worker
+/// (and delay `q` until the next `.await`). `stop` is checked between steps; the
+/// current refresh cannot be interrupted, but the UI no longer waits for it.
+pub fn run(config: Config, tx: watch::Sender<Snapshot>, storage: Storage, stop: &AtomicBool) {
+    if stop.load(Ordering::Relaxed) {
+        return;
+    }
     let mut collector = Collector::new(config.clone());
-    tokio::time::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL).await;
+    if wait_or_stop(stop, sysinfo::MINIMUM_CPU_UPDATE_INTERVAL) {
+        return;
+    }
 
     let interval = Duration::from_secs(config.general.refresh_interval.max(1));
-    let mut ticker = tokio::time::interval(interval);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-    let mut last_growth = std::time::Instant::now()
+    let mut last_growth = Instant::now()
         .checked_sub(Duration::from_secs(config.disk.snapshot_interval))
-        .unwrap_or_else(std::time::Instant::now);
+        .unwrap_or_else(Instant::now);
     let watched = config.disk.watched_paths.clone();
     let snapshot_every = Duration::from_secs(config.disk.snapshot_interval.max(30));
     let retention_days = config.general.history_retention_days;
 
     loop {
-        ticker.tick().await;
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
         let snap = collector.collect();
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
         if let Err(err) = persist_snapshot(&storage, &snap) {
             warn!(error = %err, "failed to persist snapshot");
         }
         if last_growth.elapsed() >= snapshot_every {
-            last_growth = std::time::Instant::now();
+            last_growth = Instant::now();
             let paths = watched.clone();
             let store = storage.clone();
-            tokio::task::spawn_blocking(move || {
+            std::thread::spawn(move || {
                 let sizes = growth::scan_paths(&paths);
                 if let Err(err) = store.insert_dirs(&sizes) {
                     warn!(error = %err, "failed to persist growth snapshot");
@@ -276,7 +287,24 @@ pub async fn run(config: Config, tx: watch::Sender<Snapshot>, storage: Storage) 
         if tx.send(snap).is_err() {
             break;
         }
+        if wait_or_stop(stop, interval) {
+            break;
+        }
     }
+}
+
+/// Sleep `total` in small slices so shutdown is noticed without waiting the full interval.
+/// Returns true if `stop` was set.
+fn wait_or_stop(stop: &AtomicBool, total: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < total {
+        if stop.load(Ordering::Relaxed) {
+            return true;
+        }
+        let left = total.saturating_sub(start.elapsed());
+        std::thread::sleep(left.min(Duration::from_millis(50)));
+    }
+    stop.load(Ordering::Relaxed)
 }
 
 fn persist_snapshot(storage: &Storage, snap: &Snapshot) -> anyhow::Result<()> {
@@ -298,5 +326,13 @@ mod tests {
         assert!(snap.memory.total > 0);
         assert!(!snap.cpu.cores.is_empty());
         assert!(snap.process_count > 0);
+    }
+
+    #[test]
+    fn wait_or_stop_returns_immediately_when_flagged() {
+        let stop = AtomicBool::new(true);
+        let start = Instant::now();
+        assert!(wait_or_stop(&stop, Duration::from_secs(5)));
+        assert!(start.elapsed() < Duration::from_millis(200));
     }
 }

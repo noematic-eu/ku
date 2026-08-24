@@ -91,7 +91,8 @@ fn draw_live(frame: &mut Frame, app: &mut App, area: Rect) {
         .highlight_symbol("▌ ");
     let offset = app.proc_state.offset();
     let len = app.visible_procs().count();
-    register_table_rows(&mut app.hits, area, offset, len, Some(Hit::CycleSort));
+    app.list_viewport_rows =
+        register_table_rows(&mut app.hits, area, offset, len, Some(Hit::CycleSort));
     frame.render_stateful_widget(table, area, &mut app.proc_state);
 }
 
@@ -137,7 +138,7 @@ fn draw_history(frame: &mut Frame, app: &mut App, area: Rect) {
         .highlight_symbol("▌ ");
     let offset = app.history_state.offset();
     let len = app.history_rows.len();
-    register_table_rows(&mut app.hits, table_area, offset, len, None);
+    app.list_viewport_rows = register_table_rows(&mut app.hits, table_area, offset, len, None);
     frame.render_stateful_widget(table, table_area, &mut app.history_state);
 
     let leak_lines: Vec<Line> = if app.leak_suspects.is_empty() {

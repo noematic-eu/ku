@@ -7,7 +7,7 @@ mod settings;
 mod widgets;
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Tabs};
@@ -18,6 +18,10 @@ use crate::hits::{Hit, tab_label, tab_rects};
 use crate::utils::format_uptime;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
+    app.poll_orphan_scan();
+    if app.is_busy() {
+        app.tick_anim();
+    }
     app.hits.clear();
     let theme = app.theme;
     let layout = Layout::vertical([
@@ -58,6 +62,40 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             draw_prompt(frame, body, app, format!("renice {pid}"), &buf);
         }
         Overlay::DiskDetail(idx) => disk::draw_detail(frame, app, body, idx),
+        Overlay::InspectOrphan { row, related } => {
+            growth::draw_orphan_inspect(frame, app, body, &row, related);
+        }
+        Overlay::ConfirmOrphanDelete { label, paths } => {
+            draw_confirm(
+                frame,
+                body,
+                app,
+                format!("delete {} ({} path(s))? [y/n]", label, paths.len()),
+            );
+        }
+        Overlay::OrphanDeleteReport {
+            removed,
+            failed,
+            hint_sudo,
+        } => growth::draw_orphan_delete_report(frame, app, body, removed, &failed, hint_sudo),
+        Overlay::ConfirmClearIgnore => {
+            let n = app.config.orphans.ignore.len();
+            draw_confirm(
+                frame,
+                body,
+                app,
+                format!("clear {n} allowlist entries? [y/n]"),
+            );
+        }
+        Overlay::GrowthExplain { stack } => {
+            if let Some(frame_data) = stack.last() {
+                growth::draw_explain(frame, app, body, frame_data, stack.len());
+            }
+        }
+    }
+
+    if app.shutting_down {
+        draw_shutdown(frame, app);
     }
 
     let _ = theme;
@@ -112,6 +150,18 @@ fn draw_header(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_footer(frame: &mut Frame, app: &mut App, area: Rect) {
+    if app.shutting_down {
+        frame.render_widget(
+            Paragraph::new(Line::from(widgets::busy_spans(
+                app.anim_tick,
+                "closing…",
+                None,
+                app.theme.muted_style(),
+            ))),
+            area,
+        );
+        return;
+    }
     let mut spans = vec![
         Span::styled(" tab ", app.theme.muted_style()),
         Span::raw("views  "),
@@ -207,6 +257,29 @@ pub fn popup_block<'a>(app: &App, title: &'a str) -> Block<'a> {
         .title(Span::styled(format!(" {title} "), app.theme.title_style()))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(app.theme.accent))
+}
+
+fn draw_shutdown(frame: &mut Frame, app: &App) {
+    let popup = centered(frame.area(), 46, 7);
+    frame.render_widget(Clear, popup);
+    let block = popup_block(app, "closing");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let spin = widgets::busy_spans(
+        app.anim_tick,
+        "stopping collectors…",
+        None,
+        app.theme.muted_style(),
+    );
+    let lines = vec![
+        Line::from(""),
+        Line::from(spin),
+        Line::from(Span::styled(
+            "background work is being cancelled",
+            app.theme.muted_style(),
+        )),
+    ];
+    frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), inner);
 }
 
 pub fn centered(area: Rect, width: u16, height: u16) -> Rect {
