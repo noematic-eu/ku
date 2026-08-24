@@ -14,7 +14,16 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             Span::raw(desc.to_string()),
         ])
     };
-    let lines = vec![
+    let mut lines: Vec<Line> = crate::BANNER
+        .lines()
+        .map(|l| Line::from(Span::styled(format!(" {l}"), theme.title_style())))
+        .collect();
+    lines.push(Line::from(Span::styled(
+        format!("  {}", crate::BANNER_TAGLINE),
+        theme.muted_style(),
+    )));
+    lines.push(Line::from(""));
+    lines.extend([
         Line::from(Span::styled(" navigation", theme.title_style())),
         k("Tab / Shift-Tab", "next / previous view"),
         k("1 2 3 4 5 6", "dash disk grow proc cfg help"),
@@ -84,6 +93,6 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             "  Disk growth scans watched_paths in the background (default every 5 minutes).",
             theme.muted_style(),
         )),
-    ];
+    ]);
     frame.render_widget(Paragraph::new(lines).block(bordered(theme, "help")), area);
 }

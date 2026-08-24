@@ -23,7 +23,8 @@ use ku::ui;
 #[command(
     name = "ku",
     version,
-    about = "TUI de monitoring système avancé (Linux + macOS)"
+    about = "TUI de monitoring système avancé (Linux + macOS)",
+    before_help = ku::BANNER
 )]
 struct Cli {
     /// Path to config.toml

@@ -1,8 +1,21 @@
 # ku
 
-TUI de monitoring système pour administrateurs. Linux et macOS. Écrit en Rust avec [ratatui](https://ratatui.rs).
+```
+ _           
+| | ___ _   _ 
+| |/ / | | | |
+|   <| |_| |
+|_|\_\ \__,_|
+htop + df + ncdu
+```
 
-Au-delà d’un `htop` classique, `ku` ajoute le suivi d’espace disque, l’évolution des dossiers (growth tracking) et le nettoyage des données orphelines d’applications désinstallées.
+TUI d’administrateur, Linux et macOS. CPU, mémoire, volumes et process en direct — plus ce que `htop` ne fait pas. **Growth** montre quels dossiers ont grandi ou disparu, et *pourquoi* (fichier vs arbre récursif). **Orphans** liste les restes d’apps désinstallées. Écrit en Rust avec [ratatui](https://ratatui.rs).
+
+![Dashboard](docs/screenshots/dash.png)
+
+![Disk](docs/screenshots/disk.png)
+
+![Growth tracking](docs/screenshots/growth.png)
 
 ## Installer / lancer
 
