@@ -38,6 +38,7 @@ cargo run --release
 ku --config /path/to/config.toml
 ku --dump-config
 ku --once                 # one text snapshot, no TUI
+ku vacuum                 # reclaim unused space in history.db
 sudo ku                   # same config/data dirs as SUDO_USER (not root)
 ```
 

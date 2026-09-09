@@ -38,6 +38,7 @@ cargo run --release
 ku --config /chemin/config.toml
 ku --dump-config
 ku --once                 # un snapshot texte, sans TUI
+ku vacuum                 # récupère l’espace inutilisé de history.db
 sudo ku                   # mêmes dossiers config/data que SUDO_USER (pas root)
 ```
 

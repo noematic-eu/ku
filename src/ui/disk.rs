@@ -62,18 +62,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
             app.disk_filter.clone()
         }
     );
-    let widths = [
-        Constraint::Fill(3),
-        Constraint::Length(8),
-        Constraint::Length(10),
-        Constraint::Length(10),
-        Constraint::Length(10),
-        Constraint::Length(10),
-        Constraint::Length(7),
-        Constraint::Length(8),
-        Constraint::Length(17),
-    ];
-    let table = Table::new(rows, widths)
+    let table = Table::new(rows, disk_column_widths())
         .header(header)
         .block(bordered(theme, &title))
         .row_highlight_style(theme.highlight())
@@ -154,5 +143,61 @@ fn format_bytes_pair(used: Option<u64>, total: Option<u64>) -> String {
     match (used, total) {
         (Some(u), Some(t)) => format!("{u} / {t}"),
         _ => "—".into(),
+    }
+}
+
+/// Column constraints for the disk table. Lengths must fit a typical 80-col
+/// terminal after borders, highlight, and spacing — otherwise cassowary can
+/// stall while resolving the overflow.
+pub(crate) fn disk_column_widths() -> [Constraint; 9] {
+    [
+        Constraint::Fill(3),
+        Constraint::Length(8),
+        Constraint::Length(10),
+        Constraint::Length(10),
+        Constraint::Length(10),
+        Constraint::Length(10),
+        Constraint::Length(7),
+        Constraint::Length(8),
+        Constraint::Length(17),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::widgets::TableState;
+
+    #[test]
+    fn disk_table_renders_without_hanging() {
+        let rows = vec![Row::new([
+            "/",
+            "apfs",
+            "SSD",
+            "1.0 TiB",
+            "700 GiB",
+            "1.8 TiB",
+            "59.5%",
+            "0.1%",
+            "████░░░░░░░░░░░░",
+        ])];
+        let header = Row::new([
+            "mount", "fs", "kind", "used", "free", "total", "%", "inodes", "bar",
+        ]);
+        for w in [40u16, 60, 80, 100, 120, 200] {
+            let backend = TestBackend::new(w, 24);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|f| {
+                    let table = Table::new(rows.clone(), disk_column_widths())
+                        .header(header.clone())
+                        .highlight_symbol("▌ ");
+                    let mut state = TableState::default().with_selected(0);
+                    f.render_stateful_widget(table, f.area(), &mut state);
+                })
+                .unwrap();
+        }
     }
 }

@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local};
-use sysinfo::{Disks, ProcessRefreshKind, ProcessesToUpdate, System, Users};
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, Users};
 use tokio::sync::watch;
 use tracing::{debug, warn};
 
@@ -85,7 +85,7 @@ pub struct Alert {
 
 pub struct Collector {
     sys: System,
-    disks: Disks,
+    disk_sampler: disk::Sampler,
     users: Users,
     cpu_hist: VecDeque<u64>,
     mem_hist: VecDeque<u64>,
@@ -103,15 +103,23 @@ impl Collector {
             true,
             ProcessRefreshKind::everything().without_tasks(),
         );
+        let mut disk_sampler = disk::Sampler::new();
+        // Brief wait so the first frame often has volumes. Never block on a
+        // hung CFURL/statvfs (Time Machine, autofs, sleeping disks).
+        disk_sampler.wait(Duration::from_millis(400));
         Self {
             sys,
-            disks: Disks::new_with_refreshed_list(),
+            disk_sampler,
             users: Users::new_with_refreshed_list(),
             cpu_hist: VecDeque::with_capacity(HISTORY_LEN),
             mem_hist: VecDeque::with_capacity(HISTORY_LEN),
             config,
             ticks: 0,
         }
+    }
+
+    pub fn wait_disks(&mut self, timeout: Duration) {
+        self.disk_sampler.wait(timeout);
     }
 
     pub fn collect(&mut self) -> Snapshot {
@@ -122,7 +130,7 @@ impl Collector {
             true,
             ProcessRefreshKind::everything().without_tasks(),
         );
-        self.disks.refresh(true);
+        self.disk_sampler.tick();
         if self.ticks.is_multiple_of(15) {
             self.users.refresh();
         }
@@ -130,7 +138,7 @@ impl Collector {
 
         let cpu = cpu::collect(&self.sys);
         let memory = memory::collect(&self.sys);
-        let disks = disk::collect(&self.disks);
+        let disks = self.disk_sampler.snapshots().to_vec();
         let processes = process::collect(&self.sys, &self.users);
         let load = System::load_average();
         let zombie_count = processes.iter().filter(|p| p.is_zombie).count();
@@ -234,8 +242,10 @@ fn build_alerts(
 }
 
 /// Dedicated OS thread: sysinfo refreshes are sync and would stall a tokio worker
-/// (and delay `q` until the next `.await`). `stop` is checked between steps; the
-/// current refresh cannot be interrupted, but the UI no longer waits for it.
+/// (and delay `q` until the next `.await`). Disk enumeration runs on a side
+/// thread so a stuck volume cannot pause CPU/mem snapshots. `stop` is checked
+/// between steps; the current CPU/process refresh cannot be interrupted, but
+/// the UI no longer waits for it.
 pub fn run(config: Config, tx: watch::Sender<Snapshot>, storage: Storage, stop: &AtomicBool) {
     if stop.load(Ordering::Relaxed) {
         return;
@@ -252,6 +262,12 @@ pub fn run(config: Config, tx: watch::Sender<Snapshot>, storage: Storage, stop: 
     let watched = config.disk.watched_paths.clone();
     let snapshot_every = Duration::from_secs(config.disk.snapshot_interval.max(30));
     let retention_days = config.general.history_retention_days;
+    // First pass ~45s after start so the UI is up; then hourly even if growth
+    // is slow or skipped.
+    const MAINTAIN_EVERY: Duration = Duration::from_secs(3600);
+    let mut last_maintain = Instant::now()
+        .checked_sub(MAINTAIN_EVERY.saturating_sub(Duration::from_secs(45)))
+        .unwrap_or_else(Instant::now);
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -269,12 +285,26 @@ pub fn run(config: Config, tx: watch::Sender<Snapshot>, storage: Storage, stop: 
             let paths = watched.clone();
             let store = storage.clone();
             std::thread::spawn(move || {
-                let sizes = growth::scan_paths(&paths);
-                if let Err(err) = store.insert_dirs(&sizes) {
+                let scan = growth::scan_paths(&paths);
+                if scan.truncated {
+                    warn!(
+                        paths = scan.sizes.len(),
+                        "growth scan truncated (time or entry cap); not persisting partial sizes"
+                    );
+                } else if let Err(err) = store.insert_dirs(&scan.sizes) {
                     warn!(error = %err, "failed to persist growth snapshot");
                 }
                 if let Err(err) = store.prune(retention_days) {
                     warn!(error = %err, "failed to prune history");
+                }
+            });
+        }
+        if last_maintain.elapsed() >= MAINTAIN_EVERY {
+            last_maintain = Instant::now();
+            let store = storage.clone();
+            std::thread::spawn(move || {
+                if let Err(err) = store.prune(retention_days) {
+                    warn!(error = %err, "failed to prune/compact history");
                 }
             });
         }
@@ -334,5 +364,14 @@ mod tests {
         let start = Instant::now();
         assert!(wait_or_stop(&stop, Duration::from_secs(5)));
         assert!(start.elapsed() < Duration::from_millis(200));
+    }
+
+    #[test]
+    fn collect_does_not_block_on_disk_sampler() {
+        let mut collector = Collector::new(Config::default());
+        let start = Instant::now();
+        let snap = collector.collect();
+        assert!(start.elapsed() < Duration::from_secs(3));
+        assert!(snap.memory.total > 0);
     }
 }

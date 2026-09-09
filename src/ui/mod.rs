@@ -6,6 +6,7 @@ mod processes;
 mod settings;
 mod widgets;
 
+use chrono::Local;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -123,7 +124,11 @@ fn draw_header(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         app.snapshot.hostname.as_str()
     };
-    let title = Line::from(vec![
+    let stale = Local::now()
+        .signed_duration_since(app.snapshot.collected_at)
+        .num_seconds()
+        >= 6;
+    let mut title_spans = vec![
         Span::styled(" ku ", app.theme.title_style()),
         Span::styled(host, Style::default().fg(app.theme.fg)),
         Span::raw("  "),
@@ -136,7 +141,12 @@ fn draw_header(frame: &mut Frame, app: &mut App, area: Rect) {
             app.snapshot.collected_at.format("%H:%M:%S").to_string(),
             app.theme.muted_style(),
         ),
-    ]);
+    ];
+    if stale {
+        title_spans.push(Span::raw("  "));
+        title_spans.push(Span::styled("stale", Style::default().fg(app.theme.yellow)));
+    }
+    let title = Line::from(title_spans);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(app.theme.border))

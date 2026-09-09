@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use walkdir::WalkDir;
 
@@ -13,6 +14,8 @@ const SKIP_DIR_NAMES: &[&str] = &[
     ".npm",
     ".cargo",
     "Library",
+    "Mobile Documents",
+    "iCloud Drive",
     "proc",
     "sys",
     "dev",
@@ -20,6 +23,8 @@ const SKIP_DIR_NAMES: &[&str] = &[
 
 const MAX_ENTRIES_PER_ROOT: usize = 80_000;
 const MAX_DEPTH: usize = 12;
+const SCAN_BUDGET: Duration = Duration::from_secs(20);
+const DIR_BUDGET: Duration = Duration::from_secs(8);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PathSize {
@@ -115,32 +120,62 @@ pub struct GrowthExplain {
     pub selected: usize,
 }
 
-pub fn scan_paths(paths: &[String]) -> Vec<PathSize> {
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScanResult {
+    pub sizes: Vec<PathSize>,
+    /// Walk hit a time or entry cap. Partial sizes must not be persisted.
+    pub truncated: bool,
+}
+
+pub fn scan_paths(paths: &[String]) -> ScanResult {
+    scan_paths_until(paths, Instant::now() + SCAN_BUDGET)
+}
+
+fn scan_paths_until(paths: &[String], deadline: Instant) -> ScanResult {
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
+    let mut truncated = false;
     for raw in paths {
+        if Instant::now() >= deadline {
+            truncated = true;
+            break;
+        }
         let path = Path::new(raw);
-        if !path.exists() {
+        if !path.exists() || is_cloud_placeholder(path) {
             continue;
         }
         let key = path.to_string_lossy().into_owned();
         if seen.insert(key.clone()) {
+            let walked = dir_size_until(path, deadline);
+            truncated |= walked.truncated;
             out.push(PathSize {
                 path: key,
-                size: dir_size(path),
+                size: walked.size,
             });
+        }
+        if truncated {
+            break;
         }
         if let Ok(entries) = std::fs::read_dir(path) {
             for entry in entries.flatten() {
+                if Instant::now() >= deadline {
+                    truncated = true;
+                    break;
+                }
                 let child = entry.path();
                 let name = entry.file_name().to_string_lossy().into_owned();
                 if name.starts_with('.') && name != ".local" {
                     continue;
                 }
+                if skip_name(&name) || is_cloud_placeholder(&child) {
+                    continue;
+                }
                 let child_key = child.to_string_lossy().into_owned();
                 if seen.insert(child_key.clone()) {
                     let size = if child.is_dir() {
-                        dir_size(&child)
+                        let walked = dir_size_until(&child, deadline);
+                        truncated |= walked.truncated;
+                        walked.size
                     } else {
                         entry.metadata().map(|m| m.len()).unwrap_or(0)
                     };
@@ -149,27 +184,54 @@ pub fn scan_paths(paths: &[String]) -> Vec<PathSize> {
                         size,
                     });
                 }
+                if truncated {
+                    break;
+                }
             }
         }
+        if truncated {
+            break;
+        }
     }
-    out
+    ScanResult {
+        sizes: out,
+        truncated,
+    }
 }
 
 pub fn dir_size(path: &Path) -> u64 {
+    dir_size_until(path, Instant::now() + DIR_BUDGET).size
+}
+
+struct Walked {
+    size: u64,
+    truncated: bool,
+}
+
+fn dir_size_until(path: &Path, deadline: Instant) -> Walked {
     let mut total = 0u64;
     let mut counted = 0usize;
     let walker = WalkDir::new(path)
         .follow_links(false)
         .max_depth(MAX_DEPTH)
         .into_iter()
-        .filter_entry(|e| {
-            let name = e.file_name().to_string_lossy();
-            !SKIP_DIR_NAMES.iter().any(|s| name.eq_ignore_ascii_case(s))
-        });
+        .filter_entry(|e| !skip_walk_entry(e));
     for entry in walker.flatten() {
+        if Instant::now() >= deadline {
+            return Walked {
+                size: total,
+                truncated: true,
+            };
+        }
         counted += 1;
         if counted > MAX_ENTRIES_PER_ROOT {
-            break;
+            return Walked {
+                size: total,
+                truncated: true,
+            };
+        }
+        if is_cloud_placeholder(entry.path()) {
+            continue;
         }
         if entry.file_type().is_file()
             && let Ok(meta) = entry.metadata()
@@ -177,7 +239,32 @@ pub fn dir_size(path: &Path) -> u64 {
             total = total.saturating_add(meta.len());
         }
     }
-    total
+    Walked {
+        size: total,
+        truncated: false,
+    }
+}
+
+fn skip_walk_entry(e: &walkdir::DirEntry) -> bool {
+    let name = e.file_name().to_string_lossy();
+    SKIP_DIR_NAMES.iter().any(|s| name.eq_ignore_ascii_case(s)) || is_cloud_placeholder(e.path())
+}
+
+#[cfg(target_os = "macos")]
+fn is_cloud_placeholder(path: &Path) -> bool {
+    use std::os::macos::fs::MetadataExt;
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    // UF_DATALESS: content lives in iCloud and is not on disk. Statting it
+    // can hang while macOS tries to materialize the file.
+    const UF_DATALESS: u32 = 0x4000_0000;
+    (meta.st_flags() & UF_DATALESS) != 0
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_cloud_placeholder(_path: &Path) -> bool {
+    false
 }
 
 pub fn compute_deltas(current: &[PathSize], previous: &[PathSize]) -> Vec<GrowthRow> {
@@ -336,10 +423,10 @@ fn explain_live(parent: &str, previous: &[PathSize]) -> Vec<Contribution> {
     if let Ok(entries) = std::fs::read_dir(parent) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if skip_name(&name) {
+            let child = entry.path();
+            if skip_name(&name) || is_cloud_placeholder(&child) {
                 continue;
             }
-            let child = entry.path();
             let key = child.to_string_lossy().into_owned();
             seen.insert(key.clone());
             let is_dir = child.is_dir();
@@ -570,8 +657,20 @@ mod tests {
         let child = dir.path().join("sub");
         fs::create_dir(&child).unwrap();
         fs::write(child.join("b.txt"), vec![0u8; 50]).unwrap();
-        let sizes = scan_paths(&[dir.path().to_string_lossy().into_owned()]);
-        assert!(sizes.iter().any(|s| s.size >= 150));
-        assert!(sizes.iter().any(|s| s.path.ends_with("sub")));
+        let scan = scan_paths(&[dir.path().to_string_lossy().into_owned()]);
+        assert!(!scan.truncated);
+        assert!(scan.sizes.iter().any(|s| s.size >= 150));
+        assert!(scan.sizes.iter().any(|s| s.path.ends_with("sub")));
+    }
+
+    #[test]
+    fn exhausted_budget_marks_scan_truncated() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), vec![0u8; 10]).unwrap();
+        let past = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(Instant::now);
+        let scan = scan_paths_until(&[dir.path().to_string_lossy().into_owned()], past);
+        assert!(scan.truncated);
     }
 }

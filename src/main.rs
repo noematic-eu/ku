@@ -36,7 +36,7 @@ struct Cli {
     dump_config: bool,
 
     /// Data directory (SQLite + logs). Defaults to the platform user data dir.
-    #[arg(long)]
+    #[arg(long, global = true)]
     data_dir: Option<PathBuf>,
 
     /// Collect one snapshot, print a summary, and exit (no TUI)
@@ -51,6 +51,8 @@ struct Cli {
 enum Command {
     /// Leftover data from uninstalled apps (list is always a dry-run)
     Orphans(OrphansArgs),
+    /// Reclaim unused space in the history database
+    Vacuum,
 }
 
 #[derive(Parser, Debug)]
@@ -93,8 +95,10 @@ struct OrphansArgs {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    if let Some(Command::Orphans(args)) = cli.command {
-        return run_orphans(args, cli.config);
+    match cli.command {
+        Some(Command::Orphans(args)) => return run_orphans(args, cli.config),
+        Some(Command::Vacuum) => return run_vacuum(cli.data_dir),
+        None => {}
     }
 
     let (config, config_path) = Config::load(cli.config.as_deref())?;
@@ -206,7 +210,7 @@ async fn run(
                 let snap = rx.borrow().clone();
                 app.apply_snapshot(snap);
             }
-            _ = tokio::time::sleep(Duration::from_millis(80)), if app.is_busy() => {}
+            _ = tokio::time::sleep(Duration::from_millis(if app.is_busy() { 80 } else { 400 })) => {}
         }
     }
     Ok(())
@@ -376,12 +380,48 @@ fn run_orphans(args: OrphansArgs, config_path: Option<PathBuf>) -> Result<()> {
     }
 }
 
+fn run_vacuum(data_dir: Option<PathBuf>) -> Result<()> {
+    use ku::utils::format_bytes;
+
+    let data_dir = data_dir.unwrap_or_else(config::default_data_dir);
+    let db_path = data_dir.join("history.db");
+    if !db_path.exists() {
+        println!("no history database at {}", db_path.display());
+        return Ok(());
+    }
+    let on_disk = |p: &std::path::Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+    let before_file = on_disk(&db_path);
+    let storage = Storage::open(&db_path)?;
+    let report = storage.compact(true)?;
+    let after_file = on_disk(&db_path);
+    println!("{}", db_path.display());
+    println!(
+        "file   {} → {}",
+        format_bytes(before_file),
+        format_bytes(after_file)
+    );
+    println!(
+        "pages  {} ({} free) → {} ({} free)",
+        format_bytes(report.before.bytes()),
+        format_bytes(report.before.wasted()),
+        format_bytes(report.after.bytes()),
+        format_bytes(report.after.wasted())
+    );
+    if report.before.wasted() == 0 && after_file.saturating_add(64 * 1024) >= before_file {
+        println!("already compact");
+    } else {
+        println!("vacuum ok");
+    }
+    Ok(())
+}
+
 fn print_once(config: Config) -> Result<()> {
     use ku::collector::Collector;
     use ku::utils::{format_bytes, format_percent, format_uptime};
 
     let mut collector = Collector::new(config);
     std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
+    collector.wait_disks(Duration::from_secs(2));
     let snap = collector.collect();
     println!(
         "{}  {}  up {}",

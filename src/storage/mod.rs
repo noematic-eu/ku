@@ -91,6 +91,10 @@ impl Storage {
             Connection::open(path).with_context(|| format!("opening sqlite {}", path.display()))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.busy_timeout(std::time::Duration::from_secs(2))?;
+        // Must be set before CREATE TABLE on a new file. Existing DBs pick
+        // this up on the next full VACUUM.
+        conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
         conn.execute_batch(SCHEMA)?;
         crate::paths::chown_to_invoker(path);
         if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
@@ -206,7 +210,34 @@ impl Storage {
                 params![cutoff],
             )?;
         }
+        reclaim(&conn, false)?;
         Ok(())
+    }
+
+    pub fn stats(&self) -> Result<DbStats> {
+        let conn = self.lock()?;
+        db_stats(&conn)
+    }
+
+    /// Reclaim unused pages. `force` always runs a full `VACUUM`.
+    pub fn compact(&self, force: bool) -> Result<CompactReport> {
+        let conn = self.lock()?;
+        let before = db_stats(&conn)?;
+        let vacuumed = reclaim(&conn, force)?;
+        let after = db_stats(&conn)?;
+        if vacuumed {
+            tracing::info!(
+                before = before.bytes(),
+                after = after.bytes(),
+                freed = before.wasted(),
+                "compacted history.db"
+            );
+        }
+        Ok(CompactReport {
+            before,
+            after,
+            vacuumed,
+        })
     }
 
     pub fn top_processes(&self, window: &str, limit: usize) -> Result<Vec<ProcessAgg>> {
@@ -318,6 +349,67 @@ impl Storage {
     }
 }
 
+/// Logical SQLite file size (page_count × page_size), not including WAL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DbStats {
+    pub page_count: u64,
+    pub freelist: u64,
+    pub page_size: u64,
+}
+
+impl DbStats {
+    pub fn bytes(self) -> u64 {
+        self.page_count.saturating_mul(self.page_size)
+    }
+
+    pub fn wasted(self) -> u64 {
+        self.freelist.saturating_mul(self.page_size)
+    }
+
+    pub fn should_compact(self) -> bool {
+        const MIN_WASTED: u64 = 8 * 1024 * 1024;
+        const MIN_FILE: u64 = 1024 * 1024;
+        self.wasted() >= MIN_WASTED
+            || (self.bytes() >= MIN_FILE
+                && self.freelist * 2 > self.page_count
+                && self.freelist > 64)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactReport {
+    pub before: DbStats,
+    pub after: DbStats,
+    pub vacuumed: bool,
+}
+
+fn db_stats(conn: &Connection) -> Result<DbStats> {
+    let page_count: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+    let freelist: i64 = conn.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+    let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+    Ok(DbStats {
+        page_count: page_count.max(0) as u64,
+        freelist: freelist.max(0) as u64,
+        page_size: page_size.max(0) as u64,
+    })
+}
+
+/// Give free pages back to the OS. Incremental first (cheap); full VACUUM
+/// only when the file is still mostly empty or `force` is set.
+fn reclaim(conn: &Connection, force: bool) -> Result<bool> {
+    conn.execute_batch("PRAGMA incremental_vacuum")?;
+    let mid = db_stats(conn)?;
+    if !force && !mid.should_compact() {
+        return Ok(false);
+    }
+    if mid.freelist == 0 && !force {
+        return Ok(false);
+    }
+    conn.execute_batch("VACUUM")?;
+    let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
+    Ok(true)
+}
+
 fn load_dirs(conn: &Connection, ts: i64) -> Result<Vec<PathSize>> {
     let mut stmt = conn.prepare("SELECT path, size FROM dirs WHERE ts = ?1")?;
     let rows = stmt.query_map(params![ts], |row| {
@@ -352,5 +444,49 @@ mod tests {
         .unwrap();
         let rows = db.growth_for_window(0).unwrap();
         assert!(rows.iter().any(|r| r.path == "/var/log"));
+    }
+
+    #[test]
+    fn should_compact_when_file_is_mostly_free() {
+        let bloated = DbStats {
+            page_count: 10_000,
+            freelist: 8_000,
+            page_size: 4096,
+        };
+        assert!(bloated.should_compact());
+        assert_eq!(bloated.wasted(), 8_000 * 4096);
+        let tiny = DbStats {
+            page_count: 20,
+            freelist: 15,
+            page_size: 4096,
+        };
+        assert!(!tiny.should_compact());
+        let healthy = DbStats {
+            page_count: 10_000,
+            freelist: 10,
+            page_size: 4096,
+        };
+        assert!(!healthy.should_compact());
+    }
+
+    #[test]
+    fn compact_reclaims_deleted_pages() {
+        let dir = tempdir().unwrap();
+        let db = Storage::open(&dir.path().join("ku.db")).unwrap();
+        let rows: Vec<PathSize> = (0..400)
+            .map(|i| PathSize {
+                path: format!("/var/log/ku-test-{i:04}"),
+                size: i * 1024,
+            })
+            .collect();
+        db.insert_dirs(&rows).unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        db.prune(0).unwrap();
+        let before = db.stats().unwrap();
+        let report = db.compact(true).unwrap();
+        assert!(report.vacuumed);
+        assert_eq!(report.after.freelist, 0);
+        assert!(report.after.bytes() <= before.bytes());
+        assert!(report.after.bytes() <= report.before.bytes());
     }
 }
