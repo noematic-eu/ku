@@ -210,7 +210,15 @@ async fn run(
                 let snap = rx.borrow().clone();
                 app.apply_snapshot(snap);
             }
-            _ = tokio::time::sleep(Duration::from_millis(if app.is_busy() { 80 } else { 400 })) => {}
+            _ = tokio::time::sleep(Duration::from_millis(if app.db_refresh_due() {
+                50
+            } else if app.is_busy() {
+                80
+            } else {
+                400
+            })) => {
+                app.retry_deferred_db();
+            }
         }
     }
     Ok(())

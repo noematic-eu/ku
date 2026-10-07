@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use walkdir::WalkDir;
@@ -25,6 +26,9 @@ const MAX_ENTRIES_PER_ROOT: usize = 80_000;
 const MAX_DEPTH: usize = 12;
 const SCAN_BUDGET: Duration = Duration::from_secs(20);
 const DIR_BUDGET: Duration = Duration::from_secs(8);
+
+/// Bumps once per directory listing so a slow child is not first on every scan.
+static CHILD_ROTATION: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PathSize {
@@ -120,11 +124,29 @@ pub struct GrowthExplain {
     pub selected: usize,
 }
 
+/// What to copy from the previous snapshot after a scan that did not finish.
+///
+/// A finished directory listing must not keep the whole root: names missing
+/// from that listing were deleted. Only paths we did not actually revisit stay.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Unfinished {
+    /// Child we did not finish. Keep this path and everything under it.
+    pub exact: Vec<String>,
+    /// `read_dir` stopped early. Keep rows strictly under the path, not the path itself.
+    pub unlisted: Vec<String>,
+    /// The root was never opened. Keep the path and everything under it.
+    pub untouched: Vec<String>,
+    /// Watched roots measured completely. Their previous rows are stale.
+    pub finished: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScanResult {
+    /// Directories and files that were measured completely.
     pub sizes: Vec<PathSize>,
-    /// Walk hit a time or entry cap. Partial sizes must not be persisted.
+    /// A directory hit the time or entry cap. Its size is not in `sizes`.
     pub truncated: bool,
+    pub keep: Unfinished,
 }
 
 pub fn scan_paths(paths: &[String]) -> ScanResult {
@@ -132,75 +154,225 @@ pub fn scan_paths(paths: &[String]) -> ScanResult {
 }
 
 fn scan_paths_until(paths: &[String], deadline: Instant) -> ScanResult {
-    let mut out = Vec::new();
-    let mut seen = std::collections::HashSet::new();
+    scan_paths_limited(paths, deadline, MAX_ENTRIES_PER_ROOT)
+}
+
+fn scan_paths_limited(paths: &[String], deadline: Instant, max_entries: usize) -> ScanResult {
+    let mut sizes = Vec::new();
+    let mut keep = Unfinished::default();
     let mut truncated = false;
     for raw in paths {
         if Instant::now() >= deadline {
             truncated = true;
-            break;
+            keep.untouched.push(raw.clone());
+            continue;
         }
         let path = Path::new(raw);
         if !path.exists() || is_cloud_placeholder(path) {
             continue;
         }
-        let key = path.to_string_lossy().into_owned();
-        if seen.insert(key.clone()) {
-            let walked = dir_size_until(path, deadline);
-            truncated |= walked.truncated;
-            out.push(PathSize {
-                path: key,
-                size: walked.size,
-            });
+        let measured = measure_root(path, deadline, max_entries);
+        truncated |= measured.truncated;
+        sizes.extend(measured.sizes);
+        keep.exact.extend(measured.exact);
+        if let Some(path) = measured.unlisted {
+            keep.unlisted.push(path);
         }
-        if truncated {
-            break;
+        if let Some(path) = measured.untouched {
+            keep.untouched.push(path);
         }
-        if let Ok(entries) = std::fs::read_dir(path) {
-            for entry in entries.flatten() {
-                if Instant::now() >= deadline {
-                    truncated = true;
-                    break;
-                }
-                let child = entry.path();
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if name.starts_with('.') && name != ".local" {
-                    continue;
-                }
-                if skip_name(&name) || is_cloud_placeholder(&child) {
-                    continue;
-                }
-                let child_key = child.to_string_lossy().into_owned();
-                if seen.insert(child_key.clone()) {
-                    let size = if child.is_dir() {
-                        let walked = dir_size_until(&child, deadline);
-                        truncated |= walked.truncated;
-                        walked.size
-                    } else {
-                        entry.metadata().map(|m| m.len()).unwrap_or(0)
-                    };
-                    out.push(PathSize {
-                        path: child_key,
-                        size,
-                    });
-                }
-                if truncated {
-                    break;
-                }
-            }
-        }
-        if truncated {
-            break;
+        if let Some(path) = measured.finished {
+            keep.finished.push(path);
         }
     }
     ScanResult {
-        sizes: out,
+        sizes: dedupe_paths(sizes),
         truncated,
+        keep,
     }
 }
 
+fn dedupe_paths(sizes: Vec<PathSize>) -> Vec<PathSize> {
+    let mut seen = HashSet::new();
+    sizes
+        .into_iter()
+        .filter(|row| seen.insert(row.path.clone()))
+        .collect()
+}
+
+struct Measured {
+    sizes: Vec<PathSize>,
+    exact: Vec<String>,
+    unlisted: Option<String>,
+    untouched: Option<String>,
+    finished: Option<String>,
+    truncated: bool,
+}
+
+/// Size a watched directory from its children. Files are measured before
+/// directory walks, and the walk order rotates so one slow child is not first
+/// on every scan. The root total is stored only when every child finished.
+fn measure_root(path: &Path, deadline: Instant, max_entries: usize) -> Measured {
+    let key = path.to_string_lossy().into_owned();
+    if path.is_file() {
+        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        return Measured {
+            sizes: vec![PathSize {
+                path: key.clone(),
+                size,
+            }],
+            exact: Vec::new(),
+            unlisted: None,
+            untouched: None,
+            finished: Some(key),
+            truncated: false,
+        };
+    }
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return Measured {
+            sizes: Vec::new(),
+            exact: Vec::new(),
+            unlisted: None,
+            untouched: Some(key),
+            finished: None,
+            truncated: true,
+        };
+    };
+
+    let mut sizes = Vec::new();
+    let mut exact = Vec::new();
+    let mut total = 0u64;
+    let mut listing_done = true;
+    let mut files = Vec::new();
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for entry in entries.flatten() {
+        if Instant::now() >= deadline {
+            listing_done = false;
+            break;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if skip_name(&name) || is_cloud_placeholder(&entry.path()) {
+            continue;
+        }
+        let child = entry.path();
+        if child.is_dir() {
+            dirs.push(child);
+        } else {
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            files.push((child, size));
+        }
+    }
+    for (child, size) in files {
+        total = total.saturating_add(size);
+        sizes.push(PathSize {
+            path: child.to_string_lossy().into_owned(),
+            size,
+        });
+    }
+    if !dirs.is_empty() {
+        let rot = CHILD_ROTATION.fetch_add(1, Ordering::Relaxed) % dirs.len();
+        dirs.rotate_left(rot);
+    }
+    let mut dirs_done = true;
+    for (index, child) in dirs.iter().enumerate() {
+        if Instant::now() >= deadline {
+            dirs_done = false;
+            for rest in dirs.iter().skip(index) {
+                exact.push(rest.to_string_lossy().into_owned());
+            }
+            break;
+        }
+        let child_key = child.to_string_lossy().into_owned();
+        // One folder gets at most DIR_BUDGET. The rest of the scan stays
+        // available for siblings and the other watched roots.
+        let child_deadline = Instant::now()
+            .checked_add(DIR_BUDGET)
+            .map(|cap| cap.min(deadline))
+            .unwrap_or(deadline);
+        let walked = dir_size_until(child, child_deadline, max_entries);
+        if walked.truncated {
+            dirs_done = false;
+            exact.push(child_key);
+            continue;
+        }
+        total = total.saturating_add(walked.size);
+        sizes.push(PathSize {
+            path: child_key,
+            size: walked.size,
+        });
+    }
+    let complete = listing_done && dirs_done;
+    if complete {
+        sizes.push(PathSize {
+            path: key.clone(),
+            size: total,
+        });
+    }
+    Measured {
+        sizes,
+        exact,
+        // Names we never saw are not deletions. The root total is still omitted.
+        unlisted: if listing_done {
+            None
+        } else {
+            Some(key.clone())
+        },
+        untouched: None,
+        finished: if complete { Some(key) } else { None },
+        truncated: !complete,
+    }
+}
+
+/// Keep the previous size of every path this scan did not revisit.
+/// Rows under `keep.finished` stay dropped: that root was measured completely.
+pub fn merge_unfinished(
+    mut current: Vec<PathSize>,
+    keep: &Unfinished,
+    previous: &[PathSize],
+) -> Vec<PathSize> {
+    let mut have: HashSet<String> = current.iter().map(|row| row.path.clone()).collect();
+    for prev in previous {
+        if have.contains(&prev.path) {
+            continue;
+        }
+        if keep
+            .finished
+            .iter()
+            .any(|root| path_under(root, &prev.path))
+        {
+            continue;
+        }
+        let retain = keep.exact.iter().any(|root| path_under(root, &prev.path))
+            || keep
+                .untouched
+                .iter()
+                .any(|root| path_under(root, &prev.path))
+            || keep
+                .unlisted
+                .iter()
+                .any(|root| strict_under(root, &prev.path));
+        if retain {
+            have.insert(prev.path.clone());
+            current.push(prev.clone());
+        }
+    }
+    current
+}
+
+fn strict_under(root: &str, path: &str) -> bool {
+    path_under(root, path) && path.trim_end_matches('/') != root.trim_end_matches('/')
+}
+
+fn path_under(root: &str, path: &str) -> bool {
+    let root = root.trim_end_matches('/');
+    path == root
+        || path
+            .strip_prefix(root)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
 pub fn dir_size(path: &Path) -> u64 {
-    dir_size_until(path, Instant::now() + DIR_BUDGET).size
+    dir_size_until(path, Instant::now() + DIR_BUDGET, MAX_ENTRIES_PER_ROOT).size
 }
 
 struct Walked {
@@ -208,7 +380,7 @@ struct Walked {
     truncated: bool,
 }
 
-fn dir_size_until(path: &Path, deadline: Instant) -> Walked {
+fn dir_size_until(path: &Path, deadline: Instant, max_entries: usize) -> Walked {
     let mut total = 0u64;
     let mut counted = 0usize;
     let walker = WalkDir::new(path)
@@ -224,7 +396,7 @@ fn dir_size_until(path: &Path, deadline: Instant) -> Walked {
             };
         }
         counted += 1;
-        if counted > MAX_ENTRIES_PER_ROOT {
+        if counted > max_entries {
             return Walked {
                 size: total,
                 truncated: true,
@@ -672,5 +844,146 @@ mod tests {
             .unwrap_or_else(Instant::now);
         let scan = scan_paths_until(&[dir.path().to_string_lossy().into_owned()], past);
         assert!(scan.truncated);
+        assert!(scan.sizes.is_empty());
+    }
+
+    #[test]
+    fn partial_scan_keeps_finished_entries_only() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("ok.txt"), vec![0u8; 10]).unwrap();
+        let deep = dir.path().join("deep");
+        fs::create_dir(&deep).unwrap();
+        fs::write(deep.join("a"), vec![0u8; 1]).unwrap();
+        fs::write(deep.join("b"), vec![0u8; 1]).unwrap();
+        fs::write(deep.join("c"), vec![0u8; 1]).unwrap();
+        let root = dir.path().to_string_lossy().into_owned();
+        let scan = scan_paths_limited(&[root.clone()], Instant::now() + SCAN_BUDGET, 1);
+        assert!(scan.truncated);
+        assert!(
+            scan.sizes
+                .iter()
+                .any(|s| s.path.ends_with("ok.txt") && s.size == 10)
+        );
+        assert!(
+            !scan
+                .sizes
+                .iter()
+                .any(|s| s.path.ends_with("/deep") || s.path.ends_with("\\deep"))
+        );
+        assert!(!scan.sizes.iter().any(|s| s.path == root));
+        let deep_key = deep.to_string_lossy().into_owned();
+        assert!(scan.keep.exact.iter().any(|p| p == &deep_key));
+        assert!(!scan.keep.exact.iter().any(|p| p == &root));
+        assert!(scan.keep.unlisted.is_empty());
+        assert!(scan.keep.untouched.is_empty());
+        assert!(scan.keep.finished.is_empty());
+    }
+
+    fn sample_previous() -> Vec<PathSize> {
+        vec![
+            PathSize {
+                path: "/home".into(),
+                size: 500,
+            },
+            PathSize {
+                path: "/home/deep".into(),
+                size: 99,
+            },
+            PathSize {
+                path: "/home/deep/old".into(),
+                size: 7,
+            },
+            PathSize {
+                path: "/home/gone".into(),
+                size: 5,
+            },
+            PathSize {
+                path: "/tmp".into(),
+                size: 1,
+            },
+        ]
+    }
+
+    #[test]
+    fn merge_unfinished_keeps_skipped_and_drops_deleted() {
+        let current = vec![PathSize {
+            path: "/home/ok.txt".into(),
+            size: 10,
+        }];
+        let previous = sample_previous();
+        // Listing finished. Only `/home/deep` was not measured, so a sibling
+        // that the listing no longer contains is a deletion.
+        let listed = Unfinished {
+            exact: vec!["/home/deep".into()],
+            ..Unfinished::default()
+        };
+        let merged = merge_unfinished(current.clone(), &listed, &previous);
+        assert!(
+            merged
+                .iter()
+                .any(|s| s.path == "/home/ok.txt" && s.size == 10)
+        );
+        assert!(
+            merged
+                .iter()
+                .any(|s| s.path == "/home/deep" && s.size == 99)
+        );
+        assert!(
+            merged
+                .iter()
+                .any(|s| s.path == "/home/deep/old" && s.size == 7)
+        );
+        assert!(!merged.iter().any(|s| s.path == "/home"));
+        assert!(!merged.iter().any(|s| s.path == "/home/gone"));
+        assert!(!merged.iter().any(|s| s.path == "/tmp"));
+
+        let interrupted = Unfinished {
+            unlisted: vec!["/home".into()],
+            ..Unfinished::default()
+        };
+        let merged = merge_unfinished(current, &interrupted, &previous);
+        assert!(merged.iter().any(|s| s.path == "/home/gone" && s.size == 5));
+        assert!(
+            merged
+                .iter()
+                .any(|s| s.path == "/home/deep" && s.size == 99)
+        );
+        assert!(!merged.iter().any(|s| s.path == "/home"));
+        assert!(!merged.iter().any(|s| s.path == "/tmp"));
+    }
+
+    #[test]
+    fn finished_root_drops_rows_kept_by_an_unfinished_parent() {
+        let current = vec![
+            PathSize {
+                path: "/home/deep".into(),
+                size: 40,
+            },
+            PathSize {
+                path: "/home/deep/a".into(),
+                size: 3,
+            },
+        ];
+        let keep = Unfinished {
+            exact: vec!["/home/deep".into()],
+            untouched: vec!["/home".into()],
+            finished: vec!["/home/deep".into()],
+            ..Unfinished::default()
+        };
+        let merged = merge_unfinished(current, &keep, &sample_previous());
+        assert!(
+            merged
+                .iter()
+                .any(|s| s.path == "/home/deep" && s.size == 40)
+        );
+        assert!(
+            merged
+                .iter()
+                .any(|s| s.path == "/home/deep/a" && s.size == 3)
+        );
+        assert!(!merged.iter().any(|s| s.path == "/home/deep/old"));
+        assert!(merged.iter().any(|s| s.path == "/home" && s.size == 500));
+        assert!(merged.iter().any(|s| s.path == "/home/gone" && s.size == 5));
+        assert!(!merged.iter().any(|s| s.path == "/tmp"));
     }
 }

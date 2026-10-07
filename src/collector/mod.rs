@@ -6,12 +6,13 @@ pub mod process;
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local};
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, Users};
 use tokio::sync::watch;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::storage::Storage;
@@ -243,9 +244,9 @@ fn build_alerts(
 
 /// Dedicated OS thread: sysinfo refreshes are sync and would stall a tokio worker
 /// (and delay `q` until the next `.await`). Disk enumeration runs on a side
-/// thread so a stuck volume cannot pause CPU/mem snapshots. `stop` is checked
-/// between steps; the current CPU/process refresh cannot be interrupted, but
-/// the UI no longer waits for it.
+/// thread so a stuck volume cannot pause CPU/mem snapshots. Snapshot writes run
+/// on `ku-persist` so a full `VACUUM` cannot stall the UI. `stop` is checked
+/// between steps; the current CPU/process refresh cannot be interrupted.
 pub fn run(config: Config, tx: watch::Sender<Snapshot>, storage: Storage, stop: &AtomicBool) {
     if stop.load(Ordering::Relaxed) {
         return;
@@ -268,6 +269,11 @@ pub fn run(config: Config, tx: watch::Sender<Snapshot>, storage: Storage, stop: 
     let mut last_maintain = Instant::now()
         .checked_sub(MAINTAIN_EVERY.saturating_sub(Duration::from_secs(45)))
         .unwrap_or_else(Instant::now);
+    let persist = PersistJoin::spawn(storage.clone());
+    // One growth scan at a time, prune included. Two scans blocked on the
+    // same lock would reread one snapshot and the later insert would replace
+    // the newer measurements.
+    let growth_running = Arc::new(AtomicBool::new(false));
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -277,27 +283,81 @@ pub fn run(config: Config, tx: watch::Sender<Snapshot>, storage: Storage, stop: 
         if stop.load(Ordering::Relaxed) {
             break;
         }
-        if let Err(err) = persist_snapshot(&storage, &snap) {
-            warn!(error = %err, "failed to persist snapshot");
+        debug!(
+            cpu = snap.cpu.global,
+            mem = snap.memory.used_pct(),
+            procs = snap.process_count,
+            "collected snapshot"
+        );
+        // Publish before enqueue. `ku-persist` may block in VACUUM; the
+        // header clock must not wait for that lock.
+        let published = tx.send(snap.clone()).is_ok();
+        persist.slot.push(snap);
+        if !published {
+            break;
         }
-        if last_growth.elapsed() >= snapshot_every {
-            last_growth = Instant::now();
+        if last_growth.elapsed() >= snapshot_every
+            && growth_running
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
             let paths = watched.clone();
             let store = storage.clone();
-            std::thread::spawn(move || {
-                let scan = growth::scan_paths(&paths);
-                if scan.truncated {
-                    warn!(
-                        paths = scan.sizes.len(),
-                        "growth scan truncated (time or entry cap); not persisting partial sizes"
-                    );
-                } else if let Err(err) = store.insert_dirs(&scan.sizes) {
-                    warn!(error = %err, "failed to persist growth snapshot");
+            let running = Arc::clone(&growth_running);
+            match std::thread::Builder::new()
+                .name("ku-growth".into())
+                .spawn(move || {
+                    struct Running(Arc<AtomicBool>);
+                    impl Drop for Running {
+                        fn drop(&mut self) {
+                            self.0.store(false, Ordering::Release);
+                        }
+                    }
+                    let _running = Running(running);
+                    let scan = growth::scan_paths(&paths);
+                    if scan.truncated {
+                        match store.latest_dir_snapshot() {
+                            Ok((ts, previous)) => {
+                                let merged =
+                                    growth::merge_unfinished(scan.sizes, &scan.keep, &previous);
+                                warn!(
+                                    kept = merged.len(),
+                                    exact = scan.keep.exact.len(),
+                                    unlisted = scan.keep.unlisted.len(),
+                                    untouched = scan.keep.untouched.len(),
+                                    "growth scan incomplete; kept prior sizes for unfinished paths"
+                                );
+                                persist_growth(&store, &merged, ts, true);
+                            }
+                            Err(err) => {
+                                warn!(
+                                    error = %err,
+                                    "growth scan incomplete; kept the previous snapshot"
+                                );
+                            }
+                        }
+                    } else {
+                        match store.latest_dir_snapshot() {
+                            Ok((ts, _)) => persist_growth(&store, &scan.sizes, ts, true),
+                            Err(err) => {
+                                warn!(
+                                    error = %err,
+                                    "could not read the latest growth snapshot"
+                                );
+                                persist_growth(&store, &scan.sizes, None, false);
+                            }
+                        }
+                    }
+                    if let Err(err) = store.prune(retention_days) {
+                        warn!(error = %err, "failed to prune history");
+                    }
+                }) {
+                Ok(_) => last_growth = Instant::now(),
+                Err(err) => {
+                    growth_running.store(false, Ordering::Release);
+                    warn!(error = %err, "failed to start growth scan");
                 }
-                if let Err(err) = store.prune(retention_days) {
-                    warn!(error = %err, "failed to prune history");
-                }
-            });
+            }
         }
         if last_maintain.elapsed() >= MAINTAIN_EVERY {
             last_maintain = Instant::now();
@@ -307,15 +367,6 @@ pub fn run(config: Config, tx: watch::Sender<Snapshot>, storage: Storage, stop: 
                     warn!(error = %err, "failed to prune/compact history");
                 }
             });
-        }
-        debug!(
-            cpu = snap.cpu.global,
-            mem = snap.memory.used_pct(),
-            procs = snap.process_count,
-            "collected snapshot"
-        );
-        if tx.send(snap).is_err() {
-            break;
         }
         if wait_or_stop(stop, interval) {
             break;
@@ -338,10 +389,136 @@ fn wait_or_stop(stop: &AtomicBool, total: Duration) -> bool {
 }
 
 fn persist_snapshot(storage: &Storage, snap: &Snapshot) -> anyhow::Result<()> {
-    storage.insert_metrics(snap)?;
-    storage.insert_disks(&snap.disks)?;
-    storage.insert_processes(&snap.processes)?;
-    Ok(())
+    storage.insert_snapshot(snap)
+}
+
+fn persist_growth(
+    store: &Storage,
+    sizes: &[growth::PathSize],
+    expected: Option<i64>,
+    check: bool,
+) {
+    if sizes.is_empty() {
+        warn!("growth scan produced no sizes");
+        return;
+    }
+    let result = if check {
+        store.insert_dirs_if_current(sizes, expected)
+    } else {
+        store.insert_dirs(sizes).map(|()| true)
+    };
+    match result {
+        Ok(true) => {}
+        Ok(false) => warn!("growth snapshot changed during the scan; dropped this one"),
+        Err(err) => warn!(error = %err, "failed to persist growth snapshot"),
+    }
+}
+
+/// One pending snapshot. A push replaces whatever has not been taken yet,
+/// so a long `VACUUM` cannot queue a write per sample.
+struct LatestSlot<T> {
+    inner: Mutex<SlotInner<T>>,
+    cvar: Condvar,
+}
+
+struct SlotInner<T> {
+    pending: Option<T>,
+    dropped: u64,
+    closed: bool,
+}
+
+impl<T> LatestSlot<T> {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(SlotInner {
+                pending: None,
+                dropped: 0,
+                closed: false,
+            }),
+            cvar: Condvar::new(),
+        }
+    }
+
+    fn push(&self, value: T) {
+        let mut guard = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        if guard.closed {
+            return;
+        }
+        if guard.pending.is_some() {
+            guard.dropped = guard.dropped.saturating_add(1);
+        }
+        guard.pending = Some(value);
+        self.cvar.notify_one();
+    }
+
+    /// `None` once the slot is closed and empty. The dropped count is how
+    /// many pushes were overwritten since the previous take.
+    fn pop(&self) -> Option<(T, u64)> {
+        let mut guard = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        loop {
+            if let Some(value) = guard.pending.take() {
+                let dropped = std::mem::take(&mut guard.dropped);
+                return Some((value, dropped));
+            }
+            if guard.closed {
+                return None;
+            }
+            guard = self.cvar.wait(guard).unwrap_or_else(|err| err.into_inner());
+        }
+    }
+
+    fn close(&self) {
+        let mut guard = self.inner.lock().unwrap_or_else(|err| err.into_inner());
+        guard.closed = true;
+        self.cvar.notify_one();
+    }
+}
+
+fn persist_loop(storage: Storage, slot: Arc<LatestSlot<Snapshot>>) {
+    while let Some((snap, dropped)) = slot.pop() {
+        if dropped > 0 {
+            info!(dropped, "coalesced snapshot writes");
+        }
+        if let Err(err) = persist_snapshot(&storage, &snap) {
+            warn!(error = %err, "failed to persist snapshot");
+        }
+    }
+}
+
+struct PersistJoin {
+    slot: Arc<LatestSlot<Snapshot>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PersistJoin {
+    fn spawn(storage: Storage) -> Self {
+        let slot = Arc::new(LatestSlot::new());
+        let slot_worker = Arc::clone(&slot);
+        let handle = match std::thread::Builder::new()
+            .name("ku-persist".into())
+            .spawn(move || persist_loop(storage, slot_worker))
+        {
+            Ok(handle) => Some(handle),
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "failed to spawn ku-persist; snapshots stay on screen only"
+                );
+                slot.close();
+                None
+            }
+        };
+        Self { slot, handle }
+    }
+}
+
+impl Drop for PersistJoin {
+    fn drop(&mut self) {
+        self.slot.close();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -373,5 +550,60 @@ mod tests {
         let snap = collector.collect();
         assert!(start.elapsed() < Duration::from_secs(3));
         assert!(snap.memory.total > 0);
+    }
+
+    fn tagged(uptime_secs: u64) -> Snapshot {
+        Snapshot {
+            uptime_secs,
+            ..Snapshot::default()
+        }
+    }
+
+    #[test]
+    fn latest_slot_keeps_the_newest_snapshot() {
+        let slot = LatestSlot::new();
+        slot.push(tagged(1));
+        slot.push(tagged(2));
+        slot.push(tagged(3));
+        slot.close();
+        let (snap, dropped) = slot.pop().unwrap();
+        assert_eq!(snap.uptime_secs, 3);
+        assert_eq!(dropped, 2);
+        assert!(slot.pop().is_none());
+    }
+
+    #[test]
+    fn latest_slot_ignores_push_after_close() {
+        let slot = LatestSlot::new();
+        slot.close();
+        slot.push(tagged(1));
+        assert!(slot.pop().is_none());
+    }
+
+    #[test]
+    fn latest_slot_flushes_the_pending_snapshot_on_close() {
+        let slot = LatestSlot::new();
+        slot.push(tagged(4));
+        slot.close();
+        let (snap, dropped) = slot.pop().unwrap();
+        assert_eq!(snap.uptime_secs, 4);
+        assert_eq!(dropped, 0);
+        assert!(slot.pop().is_none());
+    }
+
+    #[test]
+    fn persist_worker_writes_the_coalesced_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::storage::Storage::open(&dir.path().join("ku.db")).unwrap();
+        let slot = Arc::new(LatestSlot::new());
+        slot.push(tagged(1));
+        slot.push(tagged(2));
+        slot.push(tagged(3));
+        slot.close();
+        let db_worker = db.clone();
+        let slot_worker = Arc::clone(&slot);
+        let worker = std::thread::spawn(move || persist_loop(db_worker, slot_worker));
+        worker.join().unwrap();
+        assert_eq!(db.sample_count().unwrap(), 1);
     }
 }

@@ -1,11 +1,11 @@
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::collector::Snapshot;
 use crate::collector::growth::{GrowthRow, PathSize};
-use crate::collector::{DiskSnapshot, ProcessSnapshot, Snapshot};
 use crate::utils::parse_duration_window;
 
 const SCHEMA: &str = r#"
@@ -61,6 +61,23 @@ pub struct Storage {
     inner: Arc<Mutex<Connection>>,
 }
 
+/// The single sqlite connection is held elsewhere, usually by `VACUUM`.
+/// UI reads treat this as "keep the previous result" instead of waiting.
+#[derive(Debug)]
+pub struct DbBusy;
+
+impl std::fmt::Display for DbBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("database busy")
+    }
+}
+
+impl std::error::Error for DbBusy {}
+
+pub fn is_db_busy(err: &anyhow::Error) -> bool {
+    err.is::<DbBusy>()
+}
+
 #[derive(Debug, Clone)]
 pub struct ProcessAgg {
     pub name: String,
@@ -112,10 +129,28 @@ impl Storage {
             .map_err(|_| anyhow::anyhow!("sqlite mutex poisoned"))
     }
 
-    pub fn insert_metrics(&self, snap: &Snapshot) -> Result<()> {
+    #[cfg(test)]
+    pub(crate) fn lock_for_test(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.inner.lock().expect("sqlite mutex poisoned")
+    }
+
+    /// UI reads use this. `VACUUM` holds [`lock`](Self::lock) for the whole
+    /// rewrite; blocking here would freeze the TUI.
+    fn try_lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
+        match self.inner.try_lock() {
+            Ok(guard) => Ok(guard),
+            Err(TryLockError::WouldBlock) => Err(DbBusy.into()),
+            Err(TryLockError::Poisoned(_)) => anyhow::bail!("sqlite mutex poisoned"),
+        }
+    }
+
+    /// Metrics, disks, and processes share `snap.collected_at`, in one
+    /// transaction, so a delayed write still records one sample.
+    pub fn insert_snapshot(&self, snap: &Snapshot) -> Result<()> {
         let ts = snap.collected_at.timestamp();
         let conn = self.lock()?;
-        conn.execute(
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
             "INSERT INTO metrics (ts, cpu, mem_used, mem_total, swap_used, swap_total, load1, load5, load15, process_count)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
@@ -131,18 +166,11 @@ impl Storage {
                 snap.process_count as i64,
             ],
         )?;
-        Ok(())
-    }
-
-    pub fn insert_disks(&self, disks: &[DiskSnapshot]) -> Result<()> {
-        let ts = chrono::Local::now().timestamp();
-        let conn = self.lock()?;
-        let tx = conn.unchecked_transaction()?;
         {
             let mut stmt = tx.prepare(
                 "INSERT INTO disks (ts, mount, fs, total, used, available) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             )?;
-            for disk in disks {
+            for disk in &snap.disks {
                 stmt.execute(params![
                     ts,
                     disk.mount,
@@ -153,20 +181,13 @@ impl Storage {
                 ])?;
             }
         }
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub fn insert_processes(&self, processes: &[ProcessSnapshot]) -> Result<()> {
-        let ts = chrono::Local::now().timestamp();
-        let conn = self.lock()?;
-        let tx = conn.unchecked_transaction()?;
         {
             let mut stmt = tx.prepare(
                 "INSERT INTO processes (ts, pid, name, user, cpu, mem, virt, status, cmd)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )?;
-            for proc in processes
+            for proc in snap
+                .processes
                 .iter()
                 .filter(|p| p.cpu >= 0.3 || p.mem >= 8 * 1024 * 1024)
             {
@@ -188,17 +209,25 @@ impl Storage {
     }
 
     pub fn insert_dirs(&self, sizes: &[PathSize]) -> Result<()> {
-        let ts = chrono::Local::now().timestamp();
         let conn = self.lock()?;
-        let tx = conn.unchecked_transaction()?;
-        {
-            let mut stmt = tx.prepare("INSERT INTO dirs (ts, path, size) VALUES (?1, ?2, ?3)")?;
-            for row in sizes {
-                stmt.execute(params![ts, row.path, row.size as i64])?;
-            }
+        let latest = max_dir_ts(&conn)?;
+        write_dirs(&conn, sizes, next_dir_ts(latest))
+    }
+
+    /// Insert only when `expected` is still `MAX(ts)`. A scan that read an
+    /// older snapshot must not overwrite one that landed while it was running.
+    pub fn insert_dirs_if_current(
+        &self,
+        sizes: &[PathSize],
+        expected: Option<i64>,
+    ) -> Result<bool> {
+        let conn = self.lock()?;
+        let latest = max_dir_ts(&conn)?;
+        if latest != expected {
+            return Ok(false);
         }
-        tx.commit()?;
-        Ok(())
+        write_dirs(&conn, sizes, next_dir_ts(latest))?;
+        Ok(true)
     }
 
     pub fn prune(&self, retention_days: u32) -> Result<()> {
@@ -243,7 +272,7 @@ impl Storage {
     pub fn top_processes(&self, window: &str, limit: usize) -> Result<Vec<ProcessAgg>> {
         let secs = parse_duration_window(window).unwrap_or(300);
         let since = chrono::Local::now().timestamp() - secs;
-        let conn = self.lock()?;
+        let conn = self.try_lock()?;
         let mut stmt = conn.prepare(
             "SELECT name, AVG(cpu), MAX(cpu), AVG(mem), MAX(mem), COUNT(*)
              FROM processes
@@ -268,7 +297,7 @@ impl Storage {
     pub fn leak_suspects(&self, window: &str, limit: usize) -> Result<Vec<LeakSuspect>> {
         let secs = parse_duration_window(window).unwrap_or(3600);
         let since = chrono::Local::now().timestamp() - secs;
-        let conn = self.lock()?;
+        let conn = self.try_lock()?;
         let mut stmt = conn.prepare(
             "SELECT pid, name, MIN(mem), MAX(mem), COUNT(*)
              FROM processes
@@ -295,7 +324,7 @@ impl Storage {
     pub fn growth_snapshots(&self, window_secs: i64) -> Result<(Vec<PathSize>, Vec<PathSize>)> {
         let now = chrono::Local::now().timestamp();
         let target = now - window_secs;
-        let conn = self.lock()?;
+        let conn = self.try_lock()?;
         let latest: Option<i64> = conn
             .query_row("SELECT MAX(ts) FROM dirs", [], |row| row.get(0))
             .optional()?
@@ -333,8 +362,17 @@ impl Storage {
         ))
     }
 
-    pub fn last_growth_ts(&self) -> Result<Option<i64>> {
+    pub fn latest_dir_snapshot(&self) -> Result<(Option<i64>, Vec<PathSize>)> {
         let conn = self.lock()?;
+        let latest = max_dir_ts(&conn)?;
+        match latest {
+            Some(ts) => Ok((Some(ts), load_dirs(&conn, ts)?)),
+            None => Ok((None, Vec::new())),
+        }
+    }
+
+    pub fn last_growth_ts(&self) -> Result<Option<i64>> {
+        let conn = self.try_lock()?;
         let ts: Option<i64> = conn
             .query_row("SELECT MAX(ts) FROM dirs", [], |row| row.get(0))
             .optional()?
@@ -410,6 +448,35 @@ fn reclaim(conn: &Connection, force: bool) -> Result<bool> {
     Ok(true)
 }
 
+fn max_dir_ts(conn: &Connection) -> Result<Option<i64>> {
+    Ok(conn
+        .query_row("SELECT MAX(ts) FROM dirs", [], |row| row.get(0))
+        .optional()?
+        .flatten())
+}
+
+/// Two scans can finish in the same second. Sharing `ts` would concatenate
+/// both snapshots into one growth row set.
+fn next_dir_ts(latest: Option<i64>) -> i64 {
+    let now = chrono::Local::now().timestamp();
+    match latest {
+        Some(prev) if now <= prev => prev.saturating_add(1),
+        _ => now,
+    }
+}
+
+fn write_dirs(conn: &Connection, sizes: &[PathSize], ts: i64) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut stmt = tx.prepare("INSERT INTO dirs (ts, path, size) VALUES (?1, ?2, ?3)")?;
+        for row in sizes {
+            stmt.execute(params![ts, row.path, row.size as i64])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 fn load_dirs(conn: &Connection, ts: i64) -> Result<Vec<PathSize>> {
     let mut stmt = conn.prepare("SELECT path, size FROM dirs WHERE ts = ?1")?;
     let rows = stmt.query_map(params![ts], |row| {
@@ -444,6 +511,43 @@ mod tests {
         .unwrap();
         let rows = db.growth_for_window(0).unwrap();
         assert!(rows.iter().any(|r| r.path == "/var/log"));
+    }
+
+    #[test]
+    fn insert_dirs_rejects_a_stale_snapshot_and_does_not_share_ts() {
+        let dir = tempdir().unwrap();
+        let db = Storage::open(&dir.path().join("ku.db")).unwrap();
+        db.insert_dirs(&[PathSize {
+            path: "/home/a".into(),
+            size: 1,
+        }])
+        .unwrap();
+        let (first_ts, _) = db.latest_dir_snapshot().unwrap();
+        db.insert_dirs(&[PathSize {
+            path: "/home/a".into(),
+            size: 2,
+        }])
+        .unwrap();
+        let wrote = db
+            .insert_dirs_if_current(
+                &[PathSize {
+                    path: "/home/a".into(),
+                    size: 3,
+                }],
+                first_ts,
+            )
+            .unwrap();
+        assert!(!wrote);
+        let (latest_ts, rows) = db.latest_dir_snapshot().unwrap();
+        assert_ne!(latest_ts, first_ts);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].size, 2);
+        let distinct: i64 = db
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(DISTINCT ts) FROM dirs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(distinct, 2);
     }
 
     #[test]
@@ -488,5 +592,66 @@ mod tests {
         assert_eq!(report.after.freelist, 0);
         assert!(report.after.bytes() <= before.bytes());
         assert!(report.after.bytes() <= report.before.bytes());
+    }
+
+    #[test]
+    fn insert_snapshot_uses_one_collected_at() {
+        use crate::collector::{DiskSnapshot, ProcessSnapshot};
+
+        let dir = tempdir().unwrap();
+        let db = Storage::open(&dir.path().join("ku.db")).unwrap();
+        let ts = 1_700_000_000i64;
+        let collected_at = chrono::TimeZone::timestamp_opt(&chrono::Local, ts, 0)
+            .single()
+            .unwrap();
+        let snap = Snapshot {
+            collected_at,
+            disks: vec![DiskSnapshot {
+                mount: "/".into(),
+                fs: "apfs".into(),
+                total: 100,
+                used: 40,
+                available: 60,
+                ..DiskSnapshot::default()
+            }],
+            processes: vec![ProcessSnapshot {
+                pid: 42,
+                name: "ku".into(),
+                user: "me".into(),
+                cpu: 1.5,
+                mem: 10_000_000,
+                ..ProcessSnapshot::default()
+            }],
+            process_count: 1,
+            ..Snapshot::default()
+        };
+        db.insert_snapshot(&snap).unwrap();
+        let conn = db.lock().unwrap();
+        for table in ["metrics", "disks", "processes"] {
+            let got: i64 = conn
+                .query_row(&format!("SELECT ts FROM {table}"), [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(got, collected_at.timestamp(), "{table}");
+        }
+    }
+
+    #[test]
+    fn reads_fail_fast_while_the_connection_is_held() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let dir = tempdir().unwrap();
+        let db = Storage::open(&dir.path().join("ku.db")).unwrap();
+        let db2 = db.clone();
+        let _guard = db.lock().unwrap();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send((db2.top_processes("5m", 10), db2.growth_for_window(3600)));
+        });
+        let (top, growth) = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("read blocked on the database lock");
+        assert!(is_db_busy(&top.unwrap_err()));
+        assert!(is_db_busy(&growth.unwrap_err()));
     }
 }

@@ -17,7 +17,7 @@ use crate::collector::{Alert, Snapshot};
 use crate::config::Config;
 use crate::hits::{Hit, HitMap, SettingField};
 use crate::orphans::{self, OrphanApp, OrphanReport, OrphanRow, OrphanSort};
-use crate::storage::{LeakSuspect, ProcessAgg, Storage};
+use crate::storage::{self, LeakSuspect, ProcessAgg, Storage};
 use crate::theme::Theme;
 use crate::utils::ProcessFilter;
 
@@ -180,6 +180,15 @@ impl GrowthWindow {
             Self::D7 => Self::H1,
         }
     }
+
+    fn prev(self) -> Self {
+        match self {
+            Self::H1 => Self::D7,
+            Self::H6 => Self::H1,
+            Self::D1 => Self::H6,
+            Self::D7 => Self::D1,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -285,7 +294,13 @@ pub struct App {
     pub status_at: Instant,
     pub proc_mode: ProcMode,
     pub history_window_idx: usize,
+    /// Asked-for window. The title stays on `history_window_idx` until this load succeeds.
+    history_pending_idx: Option<usize>,
+    history_refresh_due: bool,
     pub growth_window: GrowthWindow,
+    /// Asked-for window. The title stays on `growth_window` until this load succeeds.
+    growth_pending: Option<GrowthWindow>,
+    growth_refresh_due: bool,
     pub growth_limit: GrowthLimit,
     pub growth_mode: GrowthMode,
     pub growth_rows: Vec<GrowthRow>,
@@ -342,7 +357,11 @@ impl App {
             status_at: Instant::now(),
             proc_mode: ProcMode::Live,
             history_window_idx: 0,
+            history_pending_idx: None,
+            history_refresh_due: false,
             growth_window: GrowthWindow::H1,
+            growth_pending: None,
+            growth_refresh_due: false,
             growth_limit: GrowthLimit::Top50,
             growth_mode: GrowthMode::Movers,
             growth_rows: Vec::new(),
@@ -393,10 +412,10 @@ impl App {
         self.poll_orphan_scan();
         self.refresh_derived();
         if self.proc_mode == ProcMode::History {
-            self.reload_history();
+            self.load_history(false);
         }
         if self.view == View::Growth {
-            self.reload_growth();
+            self.load_growth(false);
         }
     }
 
@@ -514,22 +533,100 @@ impl App {
     }
 
     pub fn history_window(&self) -> &str {
+        self.history_window_at(self.history_window_idx)
+    }
+
+    fn history_window_at(&self, idx: usize) -> &str {
         self.config
             .processes
             .history_window
-            .get(self.history_window_idx)
+            .get(idx)
             .map(String::as_str)
             .unwrap_or("5m")
     }
 
-    pub fn reload_growth(&mut self) {
-        match self.storage.growth_for_window(self.growth_window.secs()) {
-            Ok(rows) => self.growth_rows = rows,
-            Err(err) => self.flash(format!("growth query failed: {err}")),
+    pub fn db_refresh_due(&self) -> bool {
+        self.history_refresh_due
+            || self.history_pending_idx.is_some()
+            || self.growth_refresh_due
+            || self.growth_pending.is_some()
+    }
+
+    /// Retry a read that lost `try_lock` to an in-flight insert or `VACUUM`.
+    pub fn retry_deferred_db(&mut self) {
+        if self.shutting_down {
+            return;
         }
-        self.last_growth_ts = self.storage.last_growth_ts().ok().flatten();
+        if self.history_refresh_due || self.history_pending_idx.is_some() {
+            self.load_history(false);
+        }
+        if self.growth_refresh_due || self.growth_pending.is_some() {
+            self.load_growth(false);
+        }
+    }
+
+    pub fn reload_growth(&mut self) {
+        self.load_growth(true);
+    }
+
+    fn queue_growth_window(&mut self, window: GrowthWindow) {
+        if window == self.growth_window && self.growth_pending.is_none() {
+            self.load_growth(true);
+            return;
+        }
+        self.growth_pending = Some(window);
+        self.load_growth(true);
+    }
+
+    fn advance_growth_window(&mut self, forward: bool) {
+        let base = self.growth_pending.unwrap_or(self.growth_window);
+        let window = if forward { base.next() } else { base.prev() };
+        self.queue_growth_window(window);
+    }
+
+    /// Rows and the on-screen window commit together, so a busy read cannot
+    /// paint the new title over the previous query.
+    fn load_growth(&mut self, report_busy: bool) {
+        let window = self.growth_pending.unwrap_or(self.growth_window);
+        let rows = match self.storage.growth_for_window(window.secs()) {
+            Ok(rows) => rows,
+            Err(err) if storage::is_db_busy(&err) => {
+                self.note_db_busy(report_busy, true);
+                return;
+            }
+            Err(err) => {
+                self.growth_pending = None;
+                self.growth_refresh_due = false;
+                self.flash(format!("growth query failed: {err}"));
+                return;
+            }
+        };
+        let ts = match self.storage.last_growth_ts() {
+            Ok(ts) => ts,
+            Err(err) if storage::is_db_busy(&err) => {
+                self.note_db_busy(report_busy, true);
+                return;
+            }
+            Err(_) => None,
+        };
+        self.growth_rows = rows;
+        self.last_growth_ts = ts;
+        self.growth_window = window;
+        self.growth_pending = None;
+        self.growth_refresh_due = false;
         let n = self.growth_len();
         clamp_sel(&mut self.growth_state, n);
+    }
+
+    fn note_db_busy(&mut self, report_busy: bool, growth: bool) {
+        if growth {
+            self.growth_refresh_due = true;
+        } else {
+            self.history_refresh_due = true;
+        }
+        if report_busy {
+            self.flash("database busy");
+        }
     }
 
     pub fn is_busy(&self) -> bool {
@@ -951,12 +1048,55 @@ impl App {
     }
 
     pub fn reload_history(&mut self) {
-        let window = self.history_window().to_string();
-        match self.storage.top_processes(&window, 80) {
-            Ok(rows) => self.history_rows = rows,
-            Err(err) => self.flash(format!("history query failed: {err}")),
+        self.load_history(true);
+    }
+
+    fn queue_history_window(&mut self, idx: usize) {
+        if idx == self.history_window_idx && self.history_pending_idx.is_none() {
+            self.load_history(true);
+            return;
         }
-        self.leak_suspects = self.storage.leak_suspects(&window, 12).unwrap_or_default();
+        self.history_pending_idx = Some(idx);
+        self.load_history(true);
+    }
+
+    fn advance_history_window(&mut self) {
+        let n = self.config.processes.history_window.len().max(1);
+        let base = self.history_pending_idx.unwrap_or(self.history_window_idx);
+        self.queue_history_window((base + 1) % n);
+    }
+
+    /// Rows, leak suspects, and the on-screen window commit together.
+    /// A busy second query must not clear `leak_suspects` or move the title.
+    fn load_history(&mut self, report_busy: bool) {
+        let idx = self.history_pending_idx.unwrap_or(self.history_window_idx);
+        let window = self.history_window_at(idx).to_string();
+        let rows = match self.storage.top_processes(&window, 80) {
+            Ok(rows) => rows,
+            Err(err) if storage::is_db_busy(&err) => {
+                self.note_db_busy(report_busy, false);
+                return;
+            }
+            Err(err) => {
+                self.history_pending_idx = None;
+                self.history_refresh_due = false;
+                self.flash(format!("history query failed: {err}"));
+                return;
+            }
+        };
+        let leaks = match self.storage.leak_suspects(&window, 12) {
+            Ok(rows) => rows,
+            Err(err) if storage::is_db_busy(&err) => {
+                self.note_db_busy(report_busy, false);
+                return;
+            }
+            Err(_) => Vec::new(),
+        };
+        self.history_rows = rows;
+        self.leak_suspects = leaks;
+        self.history_window_idx = idx;
+        self.history_pending_idx = None;
+        self.history_refresh_due = false;
         clamp_sel(&mut self.history_state, self.history_rows.len());
     }
 
@@ -1403,8 +1543,7 @@ impl App {
             KeyCode::Char('h')
                 if self.view == View::Growth && self.growth_mode == GrowthMode::Movers =>
             {
-                self.growth_window = self.growth_window.next();
-                self.reload_growth();
+                self.advance_growth_window(true);
             }
             KeyCode::Char('t')
                 if self.view == View::Growth && self.growth_mode == GrowthMode::Movers =>
@@ -1457,26 +1596,17 @@ impl App {
             KeyCode::Char('[')
                 if self.view == View::Growth && self.growth_mode == GrowthMode::Movers =>
             {
-                self.growth_window = match self.growth_window {
-                    GrowthWindow::H1 => GrowthWindow::D7,
-                    GrowthWindow::H6 => GrowthWindow::H1,
-                    GrowthWindow::D1 => GrowthWindow::H6,
-                    GrowthWindow::D7 => GrowthWindow::D1,
-                };
-                self.reload_growth();
+                self.advance_growth_window(false);
             }
             KeyCode::Char(']')
                 if self.view == View::Growth && self.growth_mode == GrowthMode::Movers =>
             {
-                self.growth_window = self.growth_window.next();
-                self.reload_growth();
+                self.advance_growth_window(true);
             }
             KeyCode::Char('n')
                 if self.view == View::Processes && self.proc_mode == ProcMode::History =>
             {
-                let n = self.config.processes.history_window.len().max(1);
-                self.history_window_idx = (self.history_window_idx + 1) % n;
-                self.reload_history();
+                self.advance_history_window();
             }
             KeyCode::Char('a')
                 if self.view == View::Processes && self.proc_mode == ProcMode::Live =>
@@ -1573,8 +1703,7 @@ impl App {
                 }
             }
             Hit::GrowthWindow => {
-                self.growth_window = self.growth_window.next();
-                self.reload_growth();
+                self.advance_growth_window(true);
             }
             Hit::GrowthLimit => {
                 self.cycle_growth_limit();
@@ -1737,6 +1866,7 @@ impl App {
                     }
                 }
             }
+            Err(err) if storage::is_db_busy(&err) => self.flash("database busy"),
             Err(err) => self.flash(format!("{err}")),
         }
     }
@@ -1863,6 +1993,91 @@ fn move_table(state: &mut TableState, len: usize, delta: i32) {
         next as usize
     };
     state.select(Some(idx));
+}
+
+#[cfg(test)]
+mod db_refresh_tests {
+    use super::*;
+    use crate::collector::growth::GrowthRow;
+    use crate::config::Config;
+    use crate::storage::Storage;
+
+    fn harness() -> (tempfile::TempDir, App, Storage) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Storage::open(&dir.path().join("ku.db")).unwrap();
+        let app = App::new(
+            Config::default(),
+            dir.path().join("config.toml"),
+            dir.path().to_path_buf(),
+            db.clone(),
+        );
+        (dir, app, db)
+    }
+
+    #[test]
+    fn history_window_waits_for_a_free_database() {
+        let (_dir, mut app, db) = harness();
+        app.proc_mode = ProcMode::History;
+        app.leak_suspects = vec![LeakSuspect {
+            pid: 7,
+            name: "kept".into(),
+            min_mem: 1,
+            max_mem: 2,
+            samples: 3,
+        }];
+        let shown = app.history_window_idx;
+        let guard = db.lock_for_test();
+        app.advance_history_window();
+        app.advance_history_window();
+        assert_eq!(app.history_window_idx, shown);
+        assert_eq!(app.history_window(), "1m");
+        assert_eq!(app.leak_suspects[0].pid, 7);
+        assert!(app.db_refresh_due());
+        assert_eq!(app.status_line(), "database busy");
+        drop(guard);
+        app.retry_deferred_db();
+        assert_eq!(app.history_window_idx, 2);
+        assert_eq!(app.history_window(), "1h");
+        assert!(app.leak_suspects.is_empty());
+        assert!(!app.db_refresh_due());
+    }
+
+    #[test]
+    fn snapshot_reload_retries_after_the_insert_lock() {
+        let (_dir, mut app, db) = harness();
+        app.proc_mode = ProcMode::History;
+        app.view = View::Growth;
+        app.growth_rows = vec![GrowthRow {
+            path: "/var/log".into(),
+            size: 10,
+            abs_delta: 1,
+            rel_delta: None,
+            is_new: false,
+            is_gone: false,
+        }];
+        let guard = db.lock_for_test();
+        app.apply_snapshot(Snapshot::default());
+        assert!(app.history_refresh_due);
+        assert!(app.growth_refresh_due);
+        assert_eq!(app.growth_rows.len(), 1);
+        assert_eq!(app.growth_window, GrowthWindow::H1);
+        drop(guard);
+        app.retry_deferred_db();
+        assert!(!app.db_refresh_due());
+        assert!(app.growth_rows.is_empty());
+    }
+
+    #[test]
+    fn growth_window_stays_on_the_loaded_rows() {
+        let (_dir, mut app, db) = harness();
+        let guard = db.lock_for_test();
+        app.queue_growth_window(GrowthWindow::D7);
+        assert_eq!(app.growth_window, GrowthWindow::H1);
+        drop(guard);
+        app.retry_deferred_db();
+        assert_eq!(app.growth_window, GrowthWindow::D7);
+        assert!(!app.db_refresh_due());
+    }
 }
 
 #[cfg(test)]
